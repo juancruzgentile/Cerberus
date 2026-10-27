@@ -1,0 +1,21 @@
+# ==============================================================================
+# Cerberus — Requisitos
+# ==============================================================================
+# Las suites de prueba en Python (schema/, ingestor-c/tests/, tests/) usan
+# EXCLUSIVAMENTE la biblioteca estándar (unittest, sqlite3, urllib, http.server).
+# No hay dependencias de PyPI: `pip install -r requirements.txt` no instala nada.
+#
+# Toolchains del sistema (verificables con `./cerberus.sh check`):
+#   - Python      >= 3.10   (solo para tests)
+#   - Compilador C (gcc o clang) con soporte C11
+#   - GNU Make    >= 4.0
+#   - Go          >= 1.23
+#   - Rust/Cargo  >= 1.80
+#   - curl        (opcional, para la demo)
+#
+# SQLite NO necesita instalarse: va embebido en cada componente
+#   (amalgamación en C, rusqlite "bundled" en Rust, modernc.org/sqlite en Go).
+#
+# Dependencias de lenguaje (se descargan solas al compilar):
+#   - Go:   alerter-go/go.mod      -> modernc.org/sqlite
+#   - Rust: search-rust/Cargo.toml -> rusqlite (bundled), serde, serde_json

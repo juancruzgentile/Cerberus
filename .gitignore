@@ -2,7 +2,9 @@
 # Cerberus - Polyglot Security & Telemetry Engine (.gitignore)
 # ==============================================================================
 
-# --- SQLite Databases & WAL/SHM Artifacts ---
+# --- Runtime, Local Databases & Runfiles ---
+run/
+data/
 *.db
 *.sqlite
 *.sqlite3

@@ -65,7 +65,31 @@ Cerberus/
 
 SQLite se compila **embebido** en cada cabeza (amalgamación en C, `rusqlite` *bundled* en Rust y `modernc.org/sqlite` puro Go): no hace falta instalar SQLite en el sistema.
 
-## Compilación y pruebas
+## Uso Rápido con el Lanzador (`cerberus.sh`)
+
+Para gestionar los tres servicios de forma unificada sin abrir tres terminales separadas:
+
+```bash
+# 1. Comprobar que tienes los compiladores y herramientas listos
+./cerberus.sh check
+
+# 2. Compilar y levantar las 3 cabezas en segundo plano
+./cerberus.sh start
+
+# 3. Ver estado de los procesos y puertos
+./cerberus.sh status
+
+# 4. Enviar eventos de prueba y consultar métricas/búsqueda FTS5
+./cerberus.sh demo
+
+# 5. Ver logs en tiempo real o detener
+./cerberus.sh logs
+./cerberus.sh stop
+```
+
+---
+
+## Compilación y pruebas manuales (Makefile)
 
 ```bash
 make build   # compila las 3 cabezas
