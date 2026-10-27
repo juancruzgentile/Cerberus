@@ -126,7 +126,8 @@ cmd_start() {
     # 3) Search Rust: búsqueda FTS5 y resumen
     spawn search "$SEARCH_BIN" --db "$DB" --serve "$SEARCH_PORT"
     wait_health "http://127.0.0.1:$SEARCH_PORT/health" "search"
-    c_ok "search (Rust)  -> http://127.0.0.1:$SEARCH_PORT  (GET /search?q=..., GET /summary)"
+    c_ok "search (Rust)  -> http://127.0.0.1:$SEARCH_PORT  (Web UI en /, GET /search, GET /summary)"
+    c_ok "Web Dashboard  -> Abre http://127.0.0.1:$SEARCH_PORT en tu navegador"
 
     c_info "Base de datos: $DB"
     c_info "Detener con: ./cerberus.sh stop"

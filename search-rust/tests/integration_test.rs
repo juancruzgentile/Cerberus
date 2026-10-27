@@ -748,4 +748,18 @@ fn test_http_server_loopback_endpoints() {
     // 5. Method Not Allowed (POST) -> 405
     let (status_post, _, _) = send_raw_http_get(port, "POST /health HTTP/1.1");
     assert_eq!(status_post, 405);
+
+    // 6. Embedded Web UI: GET / and GET /ui -> 200 OK text/html with security headers
+    let (status_root, headers_root, body_root) = send_raw_http_get(port, "GET / HTTP/1.1");
+    assert_eq!(status_root, 200);
+    assert!(headers_root.contains("Content-Type: text/html; charset=utf-8"));
+    assert!(headers_root.contains("X-Frame-Options: DENY"));
+    assert!(headers_root.contains("Content-Security-Policy:"));
+    assert!(body_root.contains("CERBERUS"));
+    assert!(body_root.contains("Simulate Event (C Ingestor)"));
+
+    let (status_ui, headers_ui, body_ui) = send_raw_http_get(port, "GET /ui HTTP/1.1");
+    assert_eq!(status_ui, 200);
+    assert!(headers_ui.contains("Content-Type: text/html; charset=utf-8"));
+    assert!(body_ui.contains("CERBERUS"));
 }

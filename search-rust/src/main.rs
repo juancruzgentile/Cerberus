@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 const MAX_HTTP_REQUEST_BYTES: usize = 8192;
 /// Socket read/write timeout in seconds.
 const HTTP_TIMEOUT_SECS: u64 = 5;
+/// Embedded single-file minimalist Web UI.
+const DASHBOARD_HTML: &str = include_str!("static/index.html");
 
 #[derive(Debug)]
 struct CliConfig {
@@ -365,6 +367,9 @@ fn handle_http_connection(mut stream: TcpStream, engine: &SearchEngine) -> Resul
     };
 
     match path {
+        "/" | "/ui" | "/index.html" => {
+            send_html_response(&mut stream, 200, "OK", DASHBOARD_HTML)?;
+        }
         "/health" => {
             let body = serde_json::to_string(&HealthPayload {
                 status: "ok",
@@ -514,6 +519,38 @@ fn send_json_response(
         status_text,
         json_body.len(),
         json_body
+    );
+
+    stream
+        .write_all(response.as_bytes())
+        .map_err(|e| format!("Socket write error: {}", e))?;
+    stream
+        .flush()
+        .map_err(|e| format!("Socket flush error: {}", e))?;
+    Ok(())
+}
+
+fn send_html_response(
+    stream: &mut TcpStream,
+    status_code: u16,
+    status_text: &str,
+    html_body: &str,
+) -> Result<(), String> {
+    let response = format!(
+        "HTTP/1.1 {} {}\r\n\
+         Content-Type: text/html; charset=utf-8\r\n\
+         Content-Length: {}\r\n\
+         X-Content-Type-Options: nosniff\r\n\
+         X-Frame-Options: DENY\r\n\
+         Content-Security-Policy: default-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:* http://localhost:*; img-src 'self' data:; frame-ancestors 'none';\r\n\
+         Cache-Control: no-cache\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        status_code,
+        status_text,
+        html_body.len(),
+        html_body
     );
 
     stream

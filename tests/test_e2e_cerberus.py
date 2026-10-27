@@ -241,6 +241,14 @@ class TestCerberusEndToEnd(unittest.TestCase):
         self.assertEqual({s["source"] for s in summary["top_sources"]},
                          {"auth-service", "payment-api"})
 
+        # ---------------- Web UI Minimalista Embebida (Rust) ----------------
+        req_ui = urllib.request.Request(f"http://127.0.0.1:{search_port}/")
+        with urllib.request.urlopen(req_ui, timeout=5) as r:
+            self.assertEqual(r.status, 200)
+            self.assertIn("text/html", r.headers.get("Content-Type", ""))
+            self.assertIn("DENY", r.headers.get("X-Frame-Options", ""))
+            self.assertIn("CERBERUS", r.read().decode())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

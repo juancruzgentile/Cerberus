@@ -76,10 +76,14 @@ Para gestionar los tres servicios de forma unificada sin abrir tres terminales s
 # 2. Compilar y levantar las 3 cabezas en segundo plano
 ./cerberus.sh start
 
-# 3. Ver estado de los procesos y puertos
+# 3. Abrir la interfaz web en tu navegador:
+#    http://127.0.0.1:8081
+#    (Dashboard minimalista oscuro: métricas en vivo, búsqueda FTS5 y simulador C11)
+
+# 4. Ver estado de los procesos y puertos
 ./cerberus.sh status
 
-# 4. Enviar eventos de prueba y consultar métricas/búsqueda FTS5
+# 5. Enviar eventos de prueba y consultar métricas/búsqueda FTS5
 ./cerberus.sh demo
 
 # 5. Ver logs en tiempo real o detener
