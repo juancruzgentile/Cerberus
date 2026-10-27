@@ -1,0 +1,77 @@
+# ==============================================================================
+# Cerberus - Polyglot Security & Telemetry Engine (.gitignore)
+# ==============================================================================
+
+# --- SQLite Databases & WAL/SHM Artifacts ---
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.db-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
+
+# --- Secrets, Credentials & Environment ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+secrets/
+
+# --- C (ingestor-c) ---
+build/
+bin/
+obj/
+*.o
+*.a
+*.so
+*.out
+*.dSYM/
+compile_commands.json
+.cache/
+ingestor-c/ingestor
+ingestor-c/build/
+
+# --- Go (alerter-go) ---
+alerter-go/alerter
+alerter-go/bin/
+*.exe
+*.exe~
+*.dll
+*.test
+*.prof
+go.work
+go.work.sum
+
+# --- Rust (search-rust) ---
+target/
+**/target/
+**/*.rs.bk
+*.pdb
+
+# --- Python & Testing Artifacts ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# --- OS & Editor Artifacts ---
+.DS_Store
+Thumbs.db
+*~
+*.swp
+*.swo
+.vscode/
+.idea/
+*.log
+tmp/
