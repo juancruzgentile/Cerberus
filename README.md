@@ -40,14 +40,70 @@ flowchart LR
 
 ```text
 Cerberus/
-├── .gitignore
-├── README.md
+├── Makefile              # Orquestación: build / test / e2e / clean
 ├── schema/
-│   └── schema.sql        # Esquema maestro SQLite WAL + FTS5 + Triggers
-├── ingestor-c/           # Cabeza 1: Ingestor de eventos en C11
-├── alerter-go/           # Cabeza 2: Motor de alertas con reintentos en Go
-└── search-rust/          # Cabeza 3: Buscador FTS5 y analítica en Rust
+│   ├── schema.sql        # Esquema maestro SQLite WAL + FTS5 + Triggers
+│   └── test_*.py         # Tests funcionales y de seguridad del esquema
+├── ingestor-c/           # Cabeza 1: Ingestor de eventos en C11 (+ tests C y ataques)
+├── alerter-go/           # Cabeza 2: Motor de alertas con reintentos en Go (+ tests)
+├── search-rust/          # Cabeza 3: Buscador FTS5 y analítica en Rust (+ tests)
+└── tests/
+    └── test_e2e_cerberus.py  # Integración End-to-End de las 3 cabezas
 ```
+
+---
+
+## Requisitos
+
+| Herramienta | Versión probada |
+|-------------|-----------------|
+| Compilador C (gcc / clang) | C11 |
+| Go | 1.23+ |
+| Rust / Cargo | 1.80+ |
+| Python 3 | 3.10+ (solo para tests) |
+| GNU Make | 4.x |
+
+SQLite se compila **embebido** en cada cabeza (amalgamación en C, `rusqlite` *bundled* en Rust y `modernc.org/sqlite` puro Go): no hace falta instalar SQLite en el sistema.
+
+## Compilación y pruebas
+
+```bash
+make build   # compila las 3 cabezas
+make test    # esquema -> C11 -> Go -> Rust -> E2E políglota
+make e2e     # solo la integración End-to-End
+make clean
+```
+
+## Ejecución de las 3 cabezas sobre la misma base
+
+```bash
+# 1) Ingestor C11 (HTTP en 127.0.0.1:8080)
+./ingestor-c/bin/cerberus-ingestor --db cerberus.db --schema schema/schema.sql --serve 8080
+
+curl -X POST http://127.0.0.1:8080/ingest -H 'Content-Type: application/json' \
+  -d '{"source":"payment-api","level":"CRITICAL","message":"Gateway timeout","webhook_url":"https://hooks.example.com/cerberus"}'
+
+# 2) Despachador Go (firma HMAC opcional, métricas en :9090)
+CERBERUS_WEBHOOK_SECRET='cambia-esto' ./alerter-go/bin/cerberus-alerter \
+  --db cerberus.db --workers 4 --metrics-addr 127.0.0.1:9090
+
+# 3) Buscador Rust (HTTP en 127.0.0.1:8081)
+./search-rust/target/release/cerberus-search --db cerberus.db --serve 8081
+curl 'http://127.0.0.1:8081/search?q=timeout*&level=CRITICAL'
+curl 'http://127.0.0.1:8081/summary'
+```
+
+> **Seguridad por defecto:** `cerberus-alerter` bloquea webhooks hacia loopback y redes privadas (RFC1918). Para desarrollo local use `--allow-loopback` / `--allow-private` explícitamente.
+
+## Cobertura de pruebas
+
+| Módulo | Funcionales | Seguridad / ataque |
+|--------|-------------|--------------------|
+| `schema/` | 5 | 4 (SQLi, JSON bombs, SSRF, higiene de repo) |
+| `ingestor-c/` | 5 + self-test | 6 (overflow 100KB, Content-Length, Slowloris, SSRF/CRLF, RST) |
+| `alerter-go/` | 5 | 6 (DNS rebinding, open redirect, response bomb, tar pit, SQLi, métricas) |
+| `search-rust/` | 14 | 5 (inyección FTS5, bytes nulos, DoS de tokens/offset, fuga de errores 500) |
+| `tests/` E2E | 1 pipeline completo C → Go → Rust con HMAC, DLQ y BM25 | |
 
 ---
 
