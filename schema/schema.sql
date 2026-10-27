@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS alert_deliveries (
         AND instr(target_url, char(13)) = 0
         AND instr(lower(target_url), '169.254.169.254') = 0
         AND instr(lower(target_url), 'metadata.google.internal') = 0
+        AND instr(lower(target_url), '0.0.0.0') = 0
     ),
     status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING', 'SENT', 'FAILED', 'DEAD')),
     attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),

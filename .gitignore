@@ -37,7 +37,10 @@ obj/
 compile_commands.json
 .cache/
 ingestor-c/ingestor
+ingestor-c/bin/
 ingestor-c/build/
+!ingestor-c/vendor/sqlite3.c
+!ingestor-c/vendor/sqlite3.h
 
 # --- Go (alerter-go) ---
 alerter-go/alerter
