@@ -11,6 +11,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stdatomic.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,7 +31,11 @@ struct cerberus_db {
     sqlite3_stmt *commit_stmt;
     sqlite3_stmt *rollback_stmt;
     char last_error[512];
+    atomic_int cancelled; /* set by cerberus_interrupt() */
 };
+
+#define CERBERUS_BUSY_TIMEOUT_MS 5000
+#define CERBERUS_BUSY_STEP_MS    10
 
 static const char *EMBEDDED_PRAGMAS_AND_SCHEMA =
     "PRAGMA journal_mode = WAL;\n"
@@ -121,6 +126,7 @@ const char *cerberus_status_str(cerberus_status_t status) {
         case CERBERUS_ERR_DB_EXEC:      return "Failed to execute SQLite statement";
         case CERBERUS_ERR_DB_CONSTRAINT:return "Database constraint violation";
         case CERBERUS_ERR_NOMEM:        return "Out of memory";
+        case CERBERUS_ERR_CANCELLED:    return "Operation cancelled (shutting down)";
         default:                        return "Unknown error";
     }
 }
@@ -451,9 +457,28 @@ static cerberus_status_t exec_simple_stmt(cerberus_db_t *db, sqlite3_stmt *stmt)
     sqlite3_reset(stmt);
     if (rc != SQLITE_DONE && rc != SQLITE_ROW) {
         set_db_error(db, NULL);
-        return CERBERUS_ERR_DB_EXEC;
+        return atomic_load(&db->cancelled) ? CERBERUS_ERR_CANCELLED : CERBERUS_ERR_DB_EXEC;
     }
     return CERBERUS_OK;
+}
+
+/* A statement failing after cerberus_interrupt() is reported as cancelled. */
+static cerberus_status_t cancelled_or(cerberus_db_t *db, cerberus_status_t st) {
+    return (st == CERBERUS_ERR_DB_EXEC && atomic_load(&db->cancelled)) ? CERBERUS_ERR_CANCELLED : st;
+}
+
+/* Replaces PRAGMA busy_timeout: same 5 s budget, but gives up at once when
+ * the handle has been cancelled, so shutdown never waits on a foreign lock. */
+static int cancellable_busy_handler(void *arg, int count) {
+    cerberus_db_t *db = (cerberus_db_t *)arg;
+    if (atomic_load(&db->cancelled)) {
+        return 0;
+    }
+    if ((long)count * CERBERUS_BUSY_STEP_MS >= CERBERUS_BUSY_TIMEOUT_MS) {
+        return 0;
+    }
+    sqlite3_sleep(CERBERUS_BUSY_STEP_MS);
+    return atomic_load(&db->cancelled) ? 0 : 1;
 }
 
 /* ============================================================================
@@ -466,8 +491,13 @@ cerberus_status_t cerberus_init(const char *db_path, const char *schema_path, ce
     }
     *out_db = NULL;
 
-    /* Pre-create or enforce 0600 permissions if not an in-memory database */
-    bool is_memory = (strcmp(db_path, ":memory:") == 0 || strncmp(db_path, "file::memory:", 13) == 0);
+    /* The DB is opened WITHOUT SQLITE_OPEN_URI, so "file:..." would be a
+     * literal filename (e.g. "file::memory:" became a real 0644 file).
+     * URIs are refused explicitly; only ":memory:" skips the 0600 policy. */
+    if (strncmp(db_path, "file:", 5) == 0) {
+        return CERBERUS_ERR_DB_OPEN;
+    }
+    bool is_memory = (strcmp(db_path, ":memory:") == 0);
     if (!is_memory) {
         int fd = open(db_path, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR);
         if (fd < 0) {
@@ -484,6 +514,7 @@ cerberus_status_t cerberus_init(const char *db_path, const char *schema_path, ce
     if (!db) {
         return CERBERUS_ERR_NOMEM;
     }
+    atomic_init(&db->cancelled, 0);
 
     int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX;
     int rc = sqlite3_open_v2(db_path, &db->conn, flags, NULL);
@@ -529,6 +560,9 @@ cerberus_status_t cerberus_init(const char *db_path, const char *schema_path, ce
         return CERBERUS_ERR_DB_SCHEMA;
     }
 
+    /* Must come after the schema: its PRAGMA busy_timeout would replace it. */
+    sqlite3_busy_handler(db->conn, cancellable_busy_handler, db);
+
     /* Ensure 0600 on WAL/SHM files if created */
     if (!is_memory) {
         (void)chmod(db_path, S_IRUSR | S_IWUSR);
@@ -560,6 +594,16 @@ cerberus_status_t cerberus_init(const char *db_path, const char *schema_path, ce
 
     *out_db = db;
     return CERBERUS_OK;
+}
+
+void cerberus_interrupt(cerberus_db_t *db) {
+    if (!db) {
+        return;
+    }
+    atomic_store(&db->cancelled, 1);
+    if (db->conn) {
+        sqlite3_interrupt(db->conn);
+    }
 }
 
 void cerberus_close(cerberus_db_t *db) {
@@ -680,6 +724,11 @@ cerberus_status_t cerberus_ingest_event(cerberus_db_t *db, const cerberus_event_
         return vstatus;
     }
 
+    if (atomic_load(&db->cancelled)) {
+        set_db_error(db, cerberus_status_str(CERBERUS_ERR_CANCELLED));
+        return CERBERUS_ERR_CANCELLED;
+    }
+
     bool is_alertable = false;
     (void)is_valid_level(event->level, &is_alertable);
     bool needs_tx = is_alertable && (event->webhook_url != NULL && event->webhook_url[0] != '\0');
@@ -697,7 +746,7 @@ cerberus_status_t cerberus_ingest_event(cerberus_db_t *db, const cerberus_event_
         if (needs_tx) {
             (void)exec_simple_stmt(db, db->rollback_stmt);
         }
-        return status;
+        return cancelled_or(db, status);
     }
 
     if (needs_tx) {
@@ -743,6 +792,11 @@ cerberus_status_t cerberus_ingest_batch(
         }
     }
 
+    if (atomic_load(&db->cancelled)) {
+        set_db_error(db, cerberus_status_str(CERBERUS_ERR_CANCELLED));
+        return CERBERUS_ERR_CANCELLED;
+    }
+
     cerberus_status_t tx_status = exec_simple_stmt(db, db->begin_imm_stmt);
     if (tx_status != CERBERUS_OK) {
         return tx_status;
@@ -752,7 +806,7 @@ cerberus_status_t cerberus_ingest_batch(
         cerberus_status_t st = insert_single_event_no_tx(db, &events[i], NULL);
         if (st != CERBERUS_OK) {
             (void)exec_simple_stmt(db, db->rollback_stmt);
-            return st;
+            return cancelled_or(db, st);
         }
     }
 

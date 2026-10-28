@@ -45,6 +45,9 @@
 #define MAX_ACTIVE_CLIENTS   32      /* concurrent connections; extra ones get 503 */
 #define MAX_CORS_ORIGINS     4
 #define MAX_ORIGIN_LEN       256
+#define SHUTDOWN_GRACE_MS    1500L   /* in-flight requests may finish normally */
+#define SHUTDOWN_CANCEL_MS   3000L   /* after cerberus_interrupt(); then give up */
+#define SERVE_WORKERS_STUCK  2       /* run_http_server(): workers still using the DB */
 
 static volatile sig_atomic_t g_stop_server = 0;
 
@@ -748,8 +751,10 @@ static void handle_http_client(int client_fd, cerberus_db_t *db) {
             int http_code = (st >= CERBERUS_ERR_NULL_PTR && st <= CERBERUS_ERR_INVALID_WEBHOOK) ||
                             st == CERBERUS_ERR_DB_CONSTRAINT
                                 ? 400
-                                : 500;
-            const char *http_txt = (http_code == 400) ? "Bad Request" : "Internal Server Error";
+                                : (st == CERBERUS_ERR_CANCELLED ? 503 : 500);
+            const char *http_txt = (http_code == 400)   ? "Bad Request"
+                                   : (http_code == 503) ? "Service Unavailable"
+                                                        : "Internal Server Error";
             send_http_json_ex(client_fd, http_code, http_txt, resp, cors_hdr);
         }
 
@@ -781,6 +786,27 @@ static void *client_worker(void *arg) {
     free(job);
     worker_done();
     return NULL;
+}
+
+/* Waits up to `ms` for every worker to finish; returns how many are left. */
+static int wait_for_workers(long ms) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += ms / 1000;
+    deadline.tv_nsec += (ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec += 1;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    pthread_mutex_lock(&g_active_mutex);
+    while (g_active_clients > 0) {
+        if (pthread_cond_timedwait(&g_active_cond, &g_active_mutex, &deadline) != 0) {
+            break;
+        }
+    }
+    int remaining = g_active_clients;
+    pthread_mutex_unlock(&g_active_mutex);
+    return remaining;
 }
 
 static int run_http_server(cerberus_db_t *db, uint16_t port) {
@@ -882,21 +908,20 @@ static int run_http_server(cerberus_db_t *db, uint16_t port) {
         }
     }
 
+    /* 1. Stop taking new requests. */
     close(server_fd);
 
-    /* Wait (bounded) for in-flight requests before the DB handle is closed */
-    struct timespec deadline;
-    clock_gettime(CLOCK_REALTIME, &deadline);
-    deadline.tv_sec += 5;
-    pthread_mutex_lock(&g_active_mutex);
-    while (g_active_clients > 0) {
-        if (pthread_cond_timedwait(&g_active_cond, &g_active_mutex, &deadline) != 0) {
-            break;
-        }
+    /* 2. Grace period: let in-flight requests finish normally. */
+    int remaining = wait_for_workers(SHUTDOWN_GRACE_MS);
+    if (remaining > 0) {
+        /* 3. Cancel what is left: running statements are interrupted, waits on
+         *    a locked database end now and queued requests get 503. */
+        fprintf(stderr, "{\"status\":\"shutdown\",\"cancelling_workers\":%d}\n", remaining);
+        cerberus_interrupt(db);
+        remaining = wait_for_workers(SHUTDOWN_CANCEL_MS);
     }
-    int remaining = g_active_clients;
-    pthread_mutex_unlock(&g_active_mutex);
-    return remaining > 0 ? 1 : 0;
+    /* 4. Only the caller closes SQLite, and only when this returns 0. */
+    return remaining > 0 ? SERVE_WORKERS_STUCK : 0;
 }
 
 /* ============================================================================
@@ -1124,6 +1149,14 @@ int main(int argc, char **argv) {
         }
     } else if (mode_serve) {
         exit_code = run_http_server(db, serve_port);
+        if (exit_code == SERVE_WORKERS_STUCK) {
+            /* Bounded exit: a worker may still be inside SQLite, so the handle
+             * is NOT closed (that would be a use-after-free). The process ends
+             * now; WAL keeps the database consistent. */
+            fprintf(stderr, "{\"status\":\"error\",\"error\":\"workers did not stop; exiting without closing the database\"}\n");
+            fflush(NULL);
+            _exit(1);
+        }
     }
 
     cerberus_close(db);
