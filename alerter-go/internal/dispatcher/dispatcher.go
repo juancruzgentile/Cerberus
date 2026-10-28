@@ -71,6 +71,10 @@ type AlertJob struct {
 	Message      string
 	MetadataJSON string
 	CreatedAt    int64
+	// LeaseUntil is the reservation deadline written by claimDueAlerts. It is
+	// also the ownership token: final state updates only apply while
+	// next_retry_at still equals this value.
+	LeaseUntil int64
 }
 
 // WebhookPayload is the structured JSON body sent via HTTP POST to the target webhook URL.
@@ -110,6 +114,10 @@ func OpenAndInitDB(ctx context.Context, dbPath, schemaPath string) (*sql.DB, err
 		return nil, errors.New("database path cannot be empty")
 	}
 
+	if err := ensurePrivateDBFile(dbPath); err != nil {
+		return nil, err
+	}
+
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		return nil, fmt.Errorf("opening sqlite database: %w", err)
@@ -144,7 +152,39 @@ func OpenAndInitDB(ctx context.Context, dbPath, schemaPath string) (*sql.DB, err
 		}
 	}
 
+	tightenCompanionFiles(dbPath)
 	return db, nil
+}
+
+func isMemoryDB(path string) bool {
+	return path == ":memory:" || strings.HasPrefix(path, "file::memory:") || strings.Contains(path, "mode=memory")
+}
+
+// ensurePrivateDBFile applies the common policy of the three heads: the
+// database file is created (or fixed) with 0600 regardless of the umask.
+func ensurePrivateDBFile(path string) error {
+	if isMemoryDB(path) || strings.HasPrefix(path, "file:") {
+		return nil
+	}
+	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return fmt.Errorf("creating database file %q: %w", path, err)
+	}
+	defer f.Close()
+	if err := f.Chmod(0o600); err != nil {
+		return fmt.Errorf("setting 0600 on %q: %w", path, err)
+	}
+	return nil
+}
+
+// tightenCompanionFiles sets 0600 on the WAL/SHM files if they exist.
+func tightenCompanionFiles(path string) {
+	if isMemoryDB(path) || strings.HasPrefix(path, "file:") {
+		return
+	}
+	for _, suffix := range []string{"-wal", "-shm"} {
+		_ = os.Chmod(path+suffix, 0o600)
+	}
 }
 
 // New creates a new Dispatcher with an SSRF-protected HTTP client.
@@ -379,7 +419,7 @@ func (d *Dispatcher) ProcessBatch(ctx context.Context) (int, error) {
 		return 0, err
 	}
 
-	jobs, err := d.fetchDueAlerts(ctx, time.Now().Unix())
+	jobs, err := d.claimDueAlerts(ctx, time.Now().Unix())
 	if err != nil {
 		return 0, err
 	}
@@ -416,41 +456,80 @@ func (d *Dispatcher) ProcessBatch(ctx context.Context) (int, error) {
 	return len(jobs), nil
 }
 
-// fetchDueAlerts selects pending/failed alerts whose retry window has arrived.
-func (d *Dispatcher) fetchDueAlerts(ctx context.Context, nowUnix int64) ([]AlertJob, error) {
-	const query = `
+// leaseSeconds is how long a claimed batch stays reserved for this process.
+// It covers the worst case of the whole batch (sequential rounds of HTTP
+// timeouts across the worker pool) plus a safety margin.
+func (d *Dispatcher) leaseSeconds() int64 {
+	rounds := (d.cfg.BatchSize + d.cfg.Workers - 1) / d.cfg.Workers
+	lease := time.Duration(rounds)*d.cfg.HTTPTimeout + 30*time.Second
+	return int64(lease.Seconds())
+}
+
+// claimDueAlerts atomically reserves due alerts and returns them.
+//
+// A single UPDATE ... RETURNING (one SQLite write transaction) moves
+// next_retry_at of every due row to now+lease. Any other alerter process
+// (or goroutine) running the same statement no longer sees those rows as due,
+// so two instances can never claim the same delivery at the same time.
+// If this process dies, the lease expires and the delivery is retried.
+func (d *Dispatcher) claimDueAlerts(ctx context.Context, nowUnix int64) ([]AlertJob, error) {
+	leaseUntil := nowUnix + d.leaseSeconds()
+	const claim = `
+		UPDATE alert_deliveries
+		SET next_retry_at = ?, updated_at = ?
+		WHERE id IN (
+			SELECT id FROM alert_deliveries
+			WHERE status IN ('PENDING', 'FAILED')
+			  AND attempts < max_attempts
+			  AND next_retry_at <= ?
+			ORDER BY next_retry_at ASC, id ASC
+			LIMIT ?
+		)
+		RETURNING id;
+	`
+	rows, err := d.db.QueryContext(ctx, claim, leaseUntil, nowUnix, nowUnix, d.cfg.BatchSize)
+	if err != nil {
+		return nil, fmt.Errorf("claiming due alerts: %w", err)
+	}
+	var ids []any
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scanning claimed id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, fmt.Errorf("iterating claimed ids: %w", err)
+	}
+	rows.Close()
+	if len(ids) == 0 {
+		return nil, nil
+	}
+
+	query := `
 		SELECT
-			ad.id,
-			ad.event_id,
-			ad.target_url,
-			ad.status,
-			ad.attempts,
-			ad.max_attempts,
-			ad.next_retry_at,
-			e.source,
-			e.level,
-			e.message,
-			e.metadata_json,
-			e.created_at
+			ad.id, ad.event_id, ad.target_url, ad.status, ad.attempts,
+			ad.max_attempts, ad.next_retry_at,
+			e.source, e.level, e.message, e.metadata_json, e.created_at
 		FROM alert_deliveries AS ad
 		INNER JOIN events AS e ON e.id = ad.event_id
-		WHERE ad.status IN ('PENDING', 'FAILED')
-		  AND ad.attempts < ad.max_attempts
-		  AND ad.next_retry_at <= ?
-		ORDER BY ad.next_retry_at ASC, ad.id ASC
-		LIMIT ?;
+		WHERE ad.next_retry_at = ? AND ad.id IN (?` + strings.Repeat(",?", len(ids)-1) + `)
+		ORDER BY ad.id ASC;
 	`
-
-	rows, err := d.db.QueryContext(ctx, query, nowUnix, d.cfg.BatchSize)
+	args := append([]any{leaseUntil}, ids...)
+	jrows, err := d.db.QueryContext(ctx, query, args...)
 	if err != nil {
-		return nil, fmt.Errorf("querying due alerts: %w", err)
+		return nil, fmt.Errorf("loading claimed alerts: %w", err)
 	}
-	defer rows.Close()
+	defer jrows.Close()
 
 	var jobs []AlertJob
-	for rows.Next() {
+	for jrows.Next() {
 		var j AlertJob
-		if err := rows.Scan(
+		if err := jrows.Scan(
 			&j.DeliveryID,
 			&j.EventID,
 			&j.TargetURL,
@@ -466,9 +545,10 @@ func (d *Dispatcher) fetchDueAlerts(ctx context.Context, nowUnix int64) ([]Alert
 		); err != nil {
 			return nil, fmt.Errorf("scanning alert row: %w", err)
 		}
+		j.LeaseUntil = leaseUntil
 		jobs = append(jobs, j)
 	}
-	if err := rows.Err(); err != nil {
+	if err := jrows.Err(); err != nil {
 		return nil, fmt.Errorf("iterating alert rows: %w", err)
 	}
 	return jobs, nil
@@ -486,7 +566,7 @@ func (d *Dispatcher) processSingleAlert(ctx context.Context, job AlertJob) {
 	nowUnix := time.Now().Unix()
 
 	if err == nil {
-		if dbErr := d.markSent(dbCtx, job.DeliveryID, attemptNum, nowUnix); dbErr != nil {
+		if dbErr := d.markSent(dbCtx, job, attemptNum, nowUnix); dbErr != nil {
 			d.logger.Error("failed to mark alert SENT",
 				"delivery_id", job.DeliveryID,
 				"event_id", job.EventID,
@@ -504,7 +584,7 @@ func (d *Dispatcher) processSingleAlert(ctx context.Context, job AlertJob) {
 	}
 
 	newStatus := "FAILED"
-	nextRetryAt := job.NextRetryAt
+	nextRetryAt := nowUnix
 	if attemptNum >= job.MaxAttempts {
 		newStatus = "DEAD"
 	} else {
@@ -517,7 +597,7 @@ func (d *Dispatcher) processSingleAlert(ctx context.Context, job AlertJob) {
 	}
 
 	errMsg := truncateError(err.Error())
-	if dbErr := d.markFailedOrDead(dbCtx, job.DeliveryID, newStatus, attemptNum, nextRetryAt, errMsg, nowUnix); dbErr != nil {
+	if dbErr := d.markFailedOrDead(dbCtx, job, newStatus, attemptNum, nextRetryAt, errMsg, nowUnix); dbErr != nil {
 		d.logger.Error("failed to update failed/dead alert state",
 			"delivery_id", job.DeliveryID,
 			"event_id", job.EventID,
@@ -577,6 +657,9 @@ func (d *Dispatcher) deliverWebhook(ctx context.Context, job AlertJob, attemptNu
 	req.Header.Set("X-Cerberus-Event-ID", fmt.Sprintf("%d", job.EventID))
 	req.Header.Set("X-Cerberus-Delivery-ID", fmt.Sprintf("%d", job.DeliveryID))
 	req.Header.Set("X-Cerberus-Attempt", fmt.Sprintf("%d", attemptNum))
+	// Stable across retries: receivers must use it to drop duplicates
+	// (delivery is at-least-once, e.g. after a crash before markSent).
+	req.Header.Set("Idempotency-Key", fmt.Sprintf("cerberus-delivery-%d", job.DeliveryID))
 
 	if d.cfg.SigningSecret != "" {
 		mac := hmac.New(sha256.New, []byte(d.cfg.SigningSecret))
@@ -611,22 +694,25 @@ func (d *Dispatcher) deliverWebhook(ctx context.Context, job AlertJob, attemptNu
 	return nil
 }
 
-func (d *Dispatcher) markSent(ctx context.Context, deliveryID int64, attempts int, nowUnix int64) error {
+// errLeaseLost means another process re-claimed the delivery after our lease
+// expired; the final state is then left to that owner.
+var errLeaseLost = errors.New("lease lost: delivery re-claimed by another worker")
+
+func (d *Dispatcher) markSent(ctx context.Context, job AlertJob, attempts int, nowUnix int64) error {
 	const stmt = `
 		UPDATE alert_deliveries
 		SET status = 'SENT',
 		    attempts = ?,
 		    last_error = '',
 		    updated_at = ?
-		WHERE id = ? AND status IN ('PENDING', 'FAILED');
+		WHERE id = ? AND status IN ('PENDING', 'FAILED') AND next_retry_at = ?;
 	`
-	_, err := d.db.ExecContext(ctx, stmt, attempts, nowUnix, deliveryID)
-	return err
+	return checkOwned(d.db.ExecContext(ctx, stmt, attempts, nowUnix, job.DeliveryID, job.LeaseUntil))
 }
 
 func (d *Dispatcher) markFailedOrDead(
 	ctx context.Context,
-	deliveryID int64,
+	job AlertJob,
 	status string,
 	attempts int,
 	nextRetryAt int64,
@@ -640,10 +726,23 @@ func (d *Dispatcher) markFailedOrDead(
 		    next_retry_at = ?,
 		    last_error = ?,
 		    updated_at = ?
-		WHERE id = ? AND status IN ('PENDING', 'FAILED');
+		WHERE id = ? AND status IN ('PENDING', 'FAILED') AND next_retry_at = ?;
 	`
-	_, err := d.db.ExecContext(ctx, stmt, status, attempts, nextRetryAt, lastError, nowUnix, deliveryID)
-	return err
+	return checkOwned(d.db.ExecContext(ctx, stmt, status, attempts, nextRetryAt, lastError, nowUnix, job.DeliveryID, job.LeaseUntil))
+}
+
+func checkOwned(res sql.Result, err error) error {
+	if err != nil {
+		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n == 0 {
+		return errLeaseLost
+	}
+	return nil
 }
 
 // GetStats returns the current count of alerts grouped by status (PENDING, SENT, FAILED, DEAD).

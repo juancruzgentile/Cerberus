@@ -290,6 +290,56 @@ pub fn validate_source(source: &str) -> Result<String, SearchError> {
     Ok(trimmed.to_string())
 }
 
+/// Reads a TEXT column tolerating invalid UTF-8 (legacy rows): invalid bytes
+/// become U+FFFD instead of failing the whole query.
+fn text_lossy(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<String> {
+    use rusqlite::types::ValueRef;
+    match row.get_ref(idx)? {
+        ValueRef::Text(b) | ValueRef::Blob(b) => Ok(String::from_utf8_lossy(b).into_owned()),
+        ValueRef::Null => Ok(String::new()),
+        ValueRef::Integer(i) => Ok(i.to_string()),
+        ValueRef::Real(r) => Ok(r.to_string()),
+    }
+}
+
+/// Common file policy for all three heads: the database file (and its
+/// `-wal`/`-shm` companions) must be private to the owner (0600).
+#[cfg(unix)]
+fn ensure_private_db_file(path: &Path) -> Result<(), SearchError> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let s = path.to_string_lossy();
+    if s == ":memory:" || s.starts_with("file::memory:") {
+        return Ok(());
+    }
+    let f = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)?;
+    f.set_permissions(fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn tighten_companion_files(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    for suffix in ["-wal", "-shm"] {
+        let mut p = path.as_os_str().to_owned();
+        p.push(suffix);
+        let _ = fs::set_permissions(&p, fs::Permissions::from_mode(0o600));
+    }
+}
+
+#[cfg(not(unix))]
+fn ensure_private_db_file(_path: &Path) -> Result<(), SearchError> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn tighten_companion_files(_path: &Path) {}
+
 /// Core SQLite FTS5 Search & Analytics Engine.
 pub struct SearchEngine {
     conn: Connection,
@@ -302,8 +352,11 @@ impl SearchEngine {
         db_path: P,
         schema_path: Option<&Path>,
     ) -> Result<Self, SearchError> {
+        let db_path = db_path.as_ref();
+        ensure_private_db_file(db_path)?;
         let conn = Connection::open(db_path)?;
         Self::configure_pragmas(&conn)?;
+        tighten_companion_files(db_path);
 
         let engine = Self { conn };
         if let Some(path) = schema_path {
@@ -467,11 +520,11 @@ impl SearchEngine {
             let rows = stmt.query_map(params_from_iter(bind_values.iter()), |row| {
                 Ok(SearchResultItem {
                     id: row.get(0)?,
-                    source: row.get(1)?,
-                    level: row.get(2)?,
-                    message: row.get(3)?,
-                    snippet: row.get(4)?,
-                    metadata_json: row.get(5)?,
+                    source: text_lossy(row, 1)?,
+                    level: text_lossy(row, 2)?,
+                    message: text_lossy(row, 3)?,
+                    snippet: text_lossy(row, 4)?,
+                    metadata_json: text_lossy(row, 5)?,
                     created_at: row.get(6)?,
                     rank: row.get(7)?,
                 })
@@ -528,11 +581,11 @@ impl SearchEngine {
             let rows = stmt.query_map(params_from_iter(bind_values.iter()), |row| {
                 Ok(SearchResultItem {
                     id: row.get(0)?,
-                    source: row.get(1)?,
-                    level: row.get(2)?,
-                    message: row.get(3)?,
-                    snippet: row.get(4)?,
-                    metadata_json: row.get(5)?,
+                    source: text_lossy(row, 1)?,
+                    level: text_lossy(row, 2)?,
+                    message: text_lossy(row, 3)?,
+                    snippet: text_lossy(row, 4)?,
+                    metadata_json: text_lossy(row, 5)?,
                     created_at: row.get(6)?,
                     rank: row.get(7)?,
                 })
@@ -595,7 +648,7 @@ impl SearchEngine {
                  LIMIT 10",
             )?;
             let rows = stmt.query_map(params![], |row| {
-                let source: String = row.get(0)?;
+                let source: String = text_lossy(row, 0)?;
                 let count: i64 = row.get(1)?;
                 Ok(SourceCount {
                     source,

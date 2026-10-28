@@ -109,10 +109,10 @@ const char *cerberus_status_str(cerberus_status_t status) {
     switch (status) {
         case CERBERUS_OK:               return "OK";
         case CERBERUS_ERR_NULL_PTR:     return "Null pointer argument";
-        case CERBERUS_ERR_INVALID_SOURCE:   return "Invalid source (must be 1..128 bytes)";
+        case CERBERUS_ERR_INVALID_SOURCE:   return "Invalid source (must be 1..128 bytes of valid UTF-8)";
         case CERBERUS_ERR_INVALID_LEVEL:    return "Invalid level (must be DEBUG, INFO, WARN, ERROR, or CRITICAL)";
-        case CERBERUS_ERR_INVALID_MESSAGE:  return "Invalid message (must be 1..8192 bytes)";
-        case CERBERUS_ERR_INVALID_METADATA: return "Invalid metadata_json (must be a JSON object <= 16384 bytes)";
+        case CERBERUS_ERR_INVALID_MESSAGE:  return "Invalid message (must be 1..8192 bytes of valid UTF-8)";
+        case CERBERUS_ERR_INVALID_METADATA: return "Invalid metadata_json (must be a UTF-8 JSON object <= 16384 bytes)";
         case CERBERUS_ERR_INVALID_WEBHOOK:  return "Invalid or unsafe webhook_url";
         case CERBERUS_ERR_IO:           return "File I/O or permission error";
         case CERBERUS_ERR_DB_OPEN:      return "Failed to open SQLite database";
@@ -130,6 +130,53 @@ const char *cerberus_last_error(const cerberus_db_t *db) {
         return "NULL database handle";
     }
     return db->last_error;
+}
+
+size_t cerberus_utf8_seq_len(const unsigned char *p, size_t avail) {
+    if (avail == 0) {
+        return 0;
+    }
+    unsigned char c = p[0];
+    if (c < 0x80) {
+        return 1;
+    }
+    size_t n;
+    unsigned char lo = 0x80, hi = 0xBF; /* allowed range for the 2nd byte */
+    if (c >= 0xC2 && c <= 0xDF) {
+        n = 2;
+    } else if (c >= 0xE0 && c <= 0xEF) {
+        n = 3;
+        if (c == 0xE0) lo = 0xA0;      /* no overlongs */
+        if (c == 0xED) hi = 0x9F;      /* no UTF-16 surrogates */
+    } else if (c >= 0xF0 && c <= 0xF4) {
+        n = 4;
+        if (c == 0xF0) lo = 0x90;      /* no overlongs */
+        if (c == 0xF4) hi = 0x8F;      /* <= U+10FFFF */
+    } else {
+        return 0;
+    }
+    if (avail < n || p[1] < lo || p[1] > hi) {
+        return 0;
+    }
+    for (size_t i = 2; i < n; ++i) {
+        if ((p[i] & 0xC0) != 0x80) {
+            return 0;
+        }
+    }
+    return n;
+}
+
+int cerberus_utf8_valid(const char *s, size_t len) {
+    const unsigned char *p = (const unsigned char *)s;
+    size_t i = 0;
+    while (i < len) {
+        size_t n = cerberus_utf8_seq_len(p + i, len - i);
+        if (n == 0) {
+            return 0;
+        }
+        i += n;
+    }
+    return 1;
 }
 
 static bool is_valid_level(const char *level, bool *out_is_alertable) {
@@ -210,6 +257,9 @@ static bool is_valid_webhook_url(const char *url) {
             /* Rejects space (0x20), \t, \n, \r, backslash, and control chars */
             return false;
         }
+    }
+    if (!cerberus_utf8_valid(url, len)) {
+        return false;
     }
 
     /* Extract authority and host portion to prevent SSRF bypasses */
@@ -323,6 +373,9 @@ cerberus_status_t cerberus_validate_event(const cerberus_event_t *event) {
             return CERBERUS_ERR_INVALID_SOURCE;
         }
     }
+    if (!cerberus_utf8_valid(event->source, source_len)) {
+        return CERBERUS_ERR_INVALID_SOURCE;
+    }
 
     if (!event->level) {
         return CERBERUS_ERR_INVALID_LEVEL;
@@ -336,13 +389,15 @@ cerberus_status_t cerberus_validate_event(const cerberus_event_t *event) {
         return CERBERUS_ERR_INVALID_MESSAGE;
     }
     size_t msg_len = strnlen(event->message, CERBERUS_MAX_MESSAGE_LEN + 1);
-    if (msg_len == 0 || msg_len > CERBERUS_MAX_MESSAGE_LEN) {
+    if (msg_len == 0 || msg_len > CERBERUS_MAX_MESSAGE_LEN ||
+        !cerberus_utf8_valid(event->message, msg_len)) {
         return CERBERUS_ERR_INVALID_MESSAGE;
     }
 
     if (event->metadata_json != NULL) {
         size_t meta_len = strnlen(event->metadata_json, CERBERUS_MAX_METADATA_LEN + 1);
         if (meta_len == 0 || meta_len > CERBERUS_MAX_METADATA_LEN ||
+            !cerberus_utf8_valid(event->metadata_json, meta_len) ||
             !is_plausible_json_object(event->metadata_json, meta_len)) {
             return CERBERUS_ERR_INVALID_METADATA;
         }
@@ -477,6 +532,14 @@ cerberus_status_t cerberus_init(const char *db_path, const char *schema_path, ce
     /* Ensure 0600 on WAL/SHM files if created */
     if (!is_memory) {
         (void)chmod(db_path, S_IRUSR | S_IWUSR);
+        const char *suffixes[] = { "-wal", "-shm" };
+        for (size_t i = 0; i < 2; ++i) {
+            char aux[4096];
+            int n = snprintf(aux, sizeof(aux), "%s%s", db_path, suffixes[i]);
+            if (n > 0 && (size_t)n < sizeof(aux)) {
+                (void)chmod(aux, S_IRUSR | S_IWUSR); /* ENOENT is fine */
+            }
+        }
     }
 
     /* Precompile Prepared Statements */

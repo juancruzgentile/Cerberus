@@ -154,8 +154,10 @@ class TestCerberusEndToEnd(unittest.TestCase):
 
             # ---------------- Cabeza 1: C11 ingestor ----------------
             ingest_port = free_port()
+            search_port = free_port()
+            dashboard_origin = f"http://127.0.0.1:{search_port}"
             self.spawn([INGESTOR_BIN, "--db", self.db_path, "--schema", SCHEMA,
-                        "--serve", ingest_port])
+                        "--serve", ingest_port, "--cors-origin", dashboard_origin])
             wait_for_health(ingest_port)
             self.assertEqual(oct(os.stat(self.db_path).st_mode & 0o777), "0o600")
 
@@ -214,8 +216,8 @@ class TestCerberusEndToEnd(unittest.TestCase):
             self.assertIn(rows[ids[3]], ("FAILED", "DEAD"))
 
         # ---------------- Cabeza 3: Rust search ----------------
-        search_port = free_port()
-        self.spawn([SEARCH_BIN, "--db", self.db_path, "--serve", search_port])
+        self.spawn([SEARCH_BIN, "--db", self.db_path, "--serve", search_port,
+                    "--ingest-url", f"http://127.0.0.1:{ingest_port}"])
         wait_for_health(search_port)
 
         q = urllib.parse.urlencode({"q": "deadlock"})
@@ -247,7 +249,47 @@ class TestCerberusEndToEnd(unittest.TestCase):
             self.assertEqual(r.status, 200)
             self.assertIn("text/html", r.headers.get("Content-Type", ""))
             self.assertIn("DENY", r.headers.get("X-Frame-Options", ""))
-            self.assertIn("CERBERUS", r.read().decode())
+            csp = r.headers.get("Content-Security-Policy", "")
+            html = r.read().decode()
+            self.assertIn("CERBERUS", html)
+
+        # ---------------- Simulador del dashboard (flujo del navegador) ----------------
+        # 1) el HTML apunta al ingestor real y la CSP lo permite
+        ingest_url = f"http://127.0.0.1:{ingest_port}"
+        self.assertIn(f'name="cerberus-ingest-url" content="{ingest_url}"', html)
+        self.assertIn(f"connect-src 'self' {ingest_url};", csp)
+        # 2) preflight CORS que haría el navegador antes del POST JSON
+        pre = urllib.request.Request(f"{ingest_url}/ingest", method="OPTIONS", headers={
+            "Origin": dashboard_origin,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        })
+        with urllib.request.urlopen(pre, timeout=5) as r:
+            self.assertEqual(r.status, 204)
+            self.assertEqual(r.headers.get("Access-Control-Allow-Origin"), dashboard_origin)
+            self.assertIn("POST", r.headers.get("Access-Control-Allow-Methods", ""))
+            self.assertIn("Content-Type", r.headers.get("Access-Control-Allow-Headers", ""))
+        # 3) envío real del formulario con cabecera Origin
+        req = urllib.request.Request(
+            f"{ingest_url}/ingest", method="POST",
+            data=json.dumps({"source": "dashboard", "level": "INFO",
+                             "message": "Español: café 日本 😀"}).encode(),
+            headers={"Content-Type": "application/json", "Origin": dashboard_origin})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            self.assertEqual(r.status, 201)
+            self.assertEqual(r.headers.get("Access-Control-Allow-Origin"), dashboard_origin)
+        q = urllib.parse.urlencode({"source": "dashboard"})
+        status, body = http_json("GET", f"http://127.0.0.1:{search_port}/search?{q}")
+        self.assertEqual(status, 200)
+        self.assertEqual(body["results"][0]["message"], "Español: café 日本 😀")
+        # 4) otro origen no puede escribir
+        evil = urllib.request.Request(
+            f"{ingest_url}/ingest", method="POST", data=b'{"source":"x","level":"INFO","message":"x"}',
+            headers={"Content-Type": "application/json", "Origin": "http://evil.example"})
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            urllib.request.urlopen(evil, timeout=5)
+        self.assertEqual(ctx.exception.code, 403)
+        ctx.exception.close()
 
 
 if __name__ == "__main__":
