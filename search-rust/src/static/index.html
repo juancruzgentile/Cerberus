@@ -1,6 +1,7 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+  <meta name="cerberus-ingest-url" content="__CERBERUS_INGEST_URL__">
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Cerberus — Telemetry & Security Engine</title>
@@ -258,7 +259,7 @@
       <span style="font-size: 11px; color: var(--text-muted); font-weight: normal;">Telemetry & Security</span>
     </div>
     <div class="badges">
-      <span class="badge badge-c">C11 Ingestor :8080</span>
+      <span class="badge badge-c" id="ingest-badge">C11 Ingestor</span>
       <span class="badge badge-go">Go Alerter :9090</span>
       <span class="badge badge-rust">Rust Search :8081</span>
       <span class="badge badge-sqlite">SQLite WAL + FTS5</span>
@@ -362,6 +363,8 @@
   </div>
 
   <script>
+    const INGEST_URL = (document.querySelector('meta[name="cerberus-ingest-url"]')?.content || "http://127.0.0.1:8080").replace(/\/+$/, "");
+    document.getElementById("ingest-badge").textContent = "C11 Ingestor " + new URL(INGEST_URL).host;
     // Escape HTML to prevent XSS attacks when rendering text
     function escapeHtml(str) {
       if (!str) return "";
@@ -464,8 +467,9 @@
       if (hook) payload.webhook_url = hook;
 
       try {
-        // Send directly to Ingestor C HTTP server (port 8080)
-        const res = await fetch("http://127.0.0.1:8080/ingest", {
+        // Ingestor URL is injected by the Rust server (--ingest-url); the C
+        // ingestor answers the CORS preflight only for the configured origin.
+        const res = await fetch(INGEST_URL + "/ingest", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload)
@@ -483,7 +487,7 @@
         }
       } catch (err) {
         fb.className = "msg-feedback err";
-        fb.textContent = `Could not connect to C Ingestor at :8080. Is it running? (${err.message})`;
+        fb.textContent = `Could not connect to C Ingestor at ${INGEST_URL}. Is it running? (${err.message})`;
       } finally {
         btn.disabled = false;
       }

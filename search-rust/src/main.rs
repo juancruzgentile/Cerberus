@@ -11,8 +11,11 @@ use std::collections::HashMap;
 use std::env;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 /// Maximum HTTP request header/line payload in bytes (`<= 8192`).
@@ -21,6 +24,12 @@ const MAX_HTTP_REQUEST_BYTES: usize = 8192;
 const HTTP_TIMEOUT_SECS: u64 = 5;
 /// Embedded single-file minimalist Web UI.
 const DASHBOARD_HTML: &str = include_str!("static/index.html");
+/// Placeholder in the dashboard replaced by the configured ingestor URL.
+const INGEST_URL_PLACEHOLDER: &str = "__CERBERUS_INGEST_URL__";
+/// Default URL of the C ingestor used by the dashboard simulator.
+const DEFAULT_INGEST_URL: &str = "http://127.0.0.1:8080";
+/// Max connections handled at the same time; extra ones get `503`.
+const MAX_CONCURRENT_CONNECTIONS: usize = 32;
 
 #[derive(Debug)]
 struct CliConfig {
@@ -33,6 +42,7 @@ struct CliConfig {
 enum ExecutionMode {
     Serve {
         port: u16,
+        ingest_url: String,
     },
     Query {
         query: Option<String>,
@@ -97,10 +107,10 @@ fn run() -> Result<(), String> {
             println!("{}", json);
             Ok(())
         }
-        ExecutionMode::Serve { port } => serve_http(
-            &config.db_path,
-            config.schema_path.as_deref(),
+        ExecutionMode::Serve { port, ingest_url } => serve_http(
+            engine,
             port,
+            &ingest_url,
         ),
     }
 }
@@ -115,6 +125,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
     let mut source: Option<String> = None;
     let mut limit: usize = DEFAULT_LIMIT;
     let mut offset: usize = 0;
+    let mut ingest_url = DEFAULT_INGEST_URL.to_string();
 
     let mut i = 0;
     while i < args.len() {
@@ -139,6 +150,11 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
                     return Err("Port cannot be 0".to_string());
                 }
                 serve_port = Some(port);
+            }
+            "--ingest-url" => {
+                i += 1;
+                let val = args.get(i).ok_or("Missing value for --ingest-url")?;
+                ingest_url = validate_ingest_url(val)?;
             }
             "--summary" => {
                 summary_flag = true;
@@ -186,7 +202,7 @@ fn parse_cli_args(args: &[String]) -> Result<CliConfig, String> {
     let db_path = db_path.unwrap_or_else(|| PathBuf::from("cerberus.db"));
 
     let mode = if let Some(port) = serve_port {
-        ExecutionMode::Serve { port }
+        ExecutionMode::Serve { port, ingest_url }
     } else if summary_flag {
         ExecutionMode::Summary
     } else if query.is_some() || level.is_some() || source.is_some() {
@@ -216,15 +232,36 @@ fn print_usage() {
         "Usage: cerberus-search --db <path> [--schema <path>] [MODE]
 Modes:
   --serve <port>                              Start HTTP server on 127.0.0.1:<port>
+  --ingest-url <url>                          C ingestor URL used by the dashboard (default http://127.0.0.1:8080)
   --summary                                   Print JSON system summary
   --query <q> [--level <lvl>] [--source <s>]  Run FTS5 search from CLI"
     );
 }
 
-fn serve_http(db_path: &Path, schema_path: Option<&Path>, port: u16) -> Result<(), String> {
-    // Initialize DB & schema once before accepting connections
-    let engine = SearchEngine::open(db_path, schema_path).map_err(|e| e.to_string())?;
+/// Only `http://127.0.0.1:<port>` / `http://localhost:<port>` are accepted,
+/// so the value is safe to embed in the HTML and in the CSP header.
+fn validate_ingest_url(raw: &str) -> Result<String, String> {
+    let url = raw.trim_end_matches('/');
+    let rest = url
+        .strip_prefix("http://127.0.0.1:")
+        .or_else(|| url.strip_prefix("http://localhost:"))
+        .ok_or_else(|| format!("--ingest-url must be http://127.0.0.1:<port> or http://localhost:<port>: {}", raw))?;
+    match rest.parse::<u16>() {
+        Ok(p) if p > 0 => Ok(url.to_string()),
+        _ => Err(format!("Invalid port in --ingest-url: {}", raw)),
+    }
+}
 
+/// Releases a connection slot when the worker thread finishes (even on panic).
+struct SlotGuard(Arc<AtomicUsize>);
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn serve_http(engine: SearchEngine, port: u16, ingest_url: &str) -> Result<(), String> {
     let addr = format!("127.0.0.1:{}", port);
     let listener = TcpListener::bind(&addr)
         .map_err(|e| format!("Failed to bind HTTP server on {}: {}", addr, e))?;
@@ -234,13 +271,44 @@ fn serve_http(db_path: &Path, schema_path: Option<&Path>, port: u16) -> Result<(
         addr
     );
 
+    // One worker thread per connection (bounded). SQLite access is serialized
+    // through the mutex: slow/idle clients no longer block other requests.
+    let ctx = Arc::new(ServerCtx {
+        engine: Mutex::new(engine),
+        dashboard_html: DASHBOARD_HTML.replace(INGEST_URL_PLACEHOLDER, ingest_url),
+        ingest_url: ingest_url.to_string(),
+    });
+    let active = Arc::new(AtomicUsize::new(0));
+
     for stream_res in listener.incoming() {
         match stream_res {
-            Ok(stream) => {
-                if let Err(err) = handle_http_connection(stream, &engine) {
+            Ok(mut stream) => {
+                if active.fetch_add(1, Ordering::SeqCst) >= MAX_CONCURRENT_CONNECTIONS {
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+                    let _ = send_json_response(
+                        &mut stream,
+                        503,
+                        "Service Unavailable",
+                        r#"{"error":"busy","message":"Too many concurrent connections"}"#,
+                    );
+                    continue;
+                }
+                let guard = SlotGuard(Arc::clone(&active));
+                let ctx = Arc::clone(&ctx);
+                let spawned = thread::Builder::new().spawn(move || {
+                    let _guard = guard;
+                    if let Err(err) = handle_http_connection(stream, &ctx) {
+                        eprintln!(
+                            "{{\"level\":\"WARN\",\"msg\":\"HTTP connection error: {}\"}}",
+                            escape_json_str(&err)
+                        );
+                    }
+                });
+                if let Err(err) = spawned {
                     eprintln!(
-                        "{{\"level\":\"WARN\",\"msg\":\"HTTP connection error: {}\"}}",
-                        escape_json_str(&err)
+                        "{{\"level\":\"ERROR\",\"msg\":\"Thread spawn failed: {}\"}}",
+                        escape_json_str(&err.to_string())
                     );
                 }
             }
@@ -256,7 +324,20 @@ fn serve_http(db_path: &Path, schema_path: Option<&Path>, port: u16) -> Result<(
     Ok(())
 }
 
-fn handle_http_connection(mut stream: TcpStream, engine: &SearchEngine) -> Result<(), String> {
+struct ServerCtx {
+    engine: Mutex<SearchEngine>,
+    dashboard_html: String,
+    ingest_url: String,
+}
+
+impl ServerCtx {
+    fn engine(&self) -> std::sync::MutexGuard<'_, SearchEngine> {
+        // A panic in another worker must not take the whole server down.
+        self.engine.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+fn handle_http_connection(mut stream: TcpStream, ctx: &ServerCtx) -> Result<(), String> {
     let total_deadline = Duration::from_secs(HTTP_TIMEOUT_SECS);
     let started = Instant::now();
     stream
@@ -368,7 +449,7 @@ fn handle_http_connection(mut stream: TcpStream, engine: &SearchEngine) -> Resul
 
     match path {
         "/" | "/ui" | "/index.html" => {
-            send_html_response(&mut stream, 200, "OK", DASHBOARD_HTML)?;
+            send_html_response(&mut stream, 200, "OK", &ctx.dashboard_html, &ctx.ingest_url)?;
         }
         "/health" => {
             let body = serde_json::to_string(&HealthPayload {
@@ -378,7 +459,11 @@ fn handle_http_connection(mut stream: TcpStream, engine: &SearchEngine) -> Resul
             .unwrap_or_else(|_| r#"{"status":"ok","service":"cerberus-search-rust"}"#.to_string());
             send_json_response(&mut stream, 200, "OK", &body)?;
         }
-        "/summary" => match engine.get_summary() {
+        "/summary" => match {
+            // Release the DB lock before writing to the socket
+            let result = ctx.engine().get_summary();
+            result
+        } {
             Ok(summary) => {
                 let body = serde_json::to_string(&summary).map_err(|e| e.to_string())?;
                 send_json_response(&mut stream, 200, "OK", &body)?;
@@ -449,7 +534,8 @@ fn handle_http_connection(mut stream: TcpStream, engine: &SearchEngine) -> Resul
                 offset,
             };
 
-            match engine.search_events(&search_query) {
+            let result = ctx.engine().search_events(&search_query);
+            match result {
                 Ok(resp) => {
                     let body = serde_json::to_string(&resp).map_err(|e| e.to_string())?;
                     send_json_response(&mut stream, 200, "OK", &body)?;
@@ -535,6 +621,7 @@ fn send_html_response(
     status_code: u16,
     status_text: &str,
     html_body: &str,
+    ingest_url: &str,
 ) -> Result<(), String> {
     let response = format!(
         "HTTP/1.1 {} {}\r\n\
@@ -542,7 +629,7 @@ fn send_html_response(
          Content-Length: {}\r\n\
          X-Content-Type-Options: nosniff\r\n\
          X-Frame-Options: DENY\r\n\
-         Content-Security-Policy: default-src 'self' 'unsafe-inline'; connect-src 'self' http://127.0.0.1:* http://localhost:*; img-src 'self' data:; frame-ancestors 'none';\r\n\
+         Content-Security-Policy: default-src 'self' 'unsafe-inline'; connect-src 'self' {}; img-src 'self' data:; frame-ancestors 'none';\r\n\
          Cache-Control: no-cache\r\n\
          Connection: close\r\n\
          \r\n\
@@ -550,6 +637,7 @@ fn send_html_response(
         status_code,
         status_text,
         html_body.len(),
+        ingest_url,
         html_body
     );
 

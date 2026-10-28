@@ -8,7 +8,9 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -155,6 +157,8 @@ func TestSecurity_OpenRedirectBlockedAllStatusCodes(t *testing.T) {
 	defer db.Close()
 
 	var secondaryHits atomic.Int32
+	var servedMu sync.Mutex
+	servedCodes := map[int]bool{}
 	redirectCodes := []int{
 		http.StatusMovedPermanently,  // 301
 		http.StatusFound,             // 302
@@ -171,12 +175,16 @@ func TestSecurity_OpenRedirectBlockedAllStatusCodes(t *testing.T) {
 		case "/redirect-meta":
 			http.Redirect(w, r, "http://169.254.169.254/latest/meta-data/iam/security-credentials/", http.StatusFound)
 		default:
-			code := http.StatusFound
-			for _, c := range redirectCodes {
-				if r.URL.Query().Get("code") == http.StatusText(c) {
-					code = c
-				}
+			// The code is sent as a number (e.g. ?code=308); an unknown value
+			// is a test bug, so answer 400 instead of silently using 302.
+			code, err := strconv.Atoi(r.URL.Query().Get("code"))
+			if err != nil || code < 300 || code > 399 {
+				w.WriteHeader(http.StatusBadRequest)
+				return
 			}
+			servedMu.Lock()
+			servedCodes[code] = true
+			servedMu.Unlock()
 			http.Redirect(w, r, "/internal-secret", code)
 		}
 	}))
@@ -204,7 +212,7 @@ func TestSecurity_OpenRedirectBlockedAllStatusCodes(t *testing.T) {
 	for _, c := range redirectCodes {
 		_, err = db.ExecContext(ctx,
 			`INSERT INTO alert_deliveries (event_id, target_url, max_attempts, next_retry_at) VALUES (?, ?, 1, ?)`,
-			eventID, srv.URL+"/bounce?code="+strings.ReplaceAll(http.StatusText(c), " ", "_"), now,
+			eventID, srv.URL+"/bounce?code="+strconv.Itoa(c), now,
 		)
 		if err != nil {
 			t.Fatalf("insert bounce %d: %v", c, err)
@@ -232,6 +240,13 @@ func TestSecurity_OpenRedirectBlockedAllStatusCodes(t *testing.T) {
 	}
 	if secondaryHits.Load() != 0 {
 		t.Fatalf("SSRF Open Redirect breach: client followed redirect %d times!", secondaryHits.Load())
+	}
+
+	// Prove that every advertised redirect code was really exercised.
+	for _, c := range redirectCodes {
+		if !servedCodes[c] {
+			t.Fatalf("redirect code %d was never served by the test server", c)
+		}
 	}
 
 	st, err := disp.GetStats(ctx)

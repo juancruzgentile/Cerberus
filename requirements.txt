@@ -9,12 +9,16 @@
 #   - Python      >= 3.10   (solo para tests)
 #   - Compilador C (gcc o clang) con soporte C11
 #   - GNU Make    >= 4.0
-#   - Go          >= 1.23
-#   - Rust/Cargo  >= 1.80
-#   - curl        (opcional, para la demo)
+#   - Go          >= 1.26.10 (go.mod; con GOTOOLCHAIN=auto, el comando `go`
+#                            descarga esa toolchain si la instalada es menor)
+#   - Rust/Cargo  >= 1.89   (lo exige rusqlite 0.41)
+#   - curl        (obligatorio para start/demo)
+#   - flock       (util-linux; lock del lanzador)
+#   - Linux       (el lanzador verifica procesos vía /proc)
 #
 # SQLite NO necesita instalarse: va embebido en cada componente
-#   (amalgamación en C, rusqlite "bundled" en Rust, modernc.org/sqlite en Go).
+#   (amalgamación 3.54.1 en C, rusqlite "bundled" 3.54.1 en Rust,
+#    modernc.org/sqlite 3.54.1 en Go).
 #
 # Dependencias de lenguaje (se descargan solas al compilar):
 #   - Go:   alerter-go/go.mod      -> modernc.org/sqlite

@@ -2,11 +2,10 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/C11-Ingestor-00599C?logo=c&logoColor=white" alt="C11 Ingestor">
-  <img src="https://img.shields.io/badge/Go_1.23-Alerter-00ADD8?logo=go&logoColor=white" alt="Go Alerter">
+  <img src="https://img.shields.io/badge/Go_1.26-Alerter-00ADD8?logo=go&logoColor=white" alt="Go Alerter">
   <img src="https://img.shields.io/badge/Rust_2021-Search_&_UI-DEA584?logo=rust&logoColor=black" alt="Rust Search">
   <img src="https://img.shields.io/badge/Storage-SQLite_WAL_+_FTS5-003B57?logo=sqlite&logoColor=white" alt="SQLite WAL">
-  <img src="https://img.shields.io/badge/Security-Hardened_&_Audited-green" alt="Security Hardened">
-  <img src="https://img.shields.io/badge/Tests-100%25_Passing-brightgreen" alt="Tests 100% Passing">
+  <a href="https://github.com/juancruzgentile/Cerberus/actions/workflows/ci.yml"><img src="https://github.com/juancruzgentile/Cerberus/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
 </p>
 
 **Cerberus** es una plataforma de observabilidad, ingesta de eventos de seguridad y despacho de alertas de alto rendimiento basada en una arquitectura políglota de tres cabezas (**C11**, **Go** y **Rust**). Cada componente fue construido en el lenguaje donde su modelo de ejecución ofrece la máxima ventaja competitiva, comunicándose de forma desacoplada y sin intermediarios pesados a través de un núcleo transaccional compartido de **SQLite en modo WAL (Write-Ahead Logging)** con búsqueda de texto completo **FTS5**.
@@ -26,7 +25,7 @@ flowchart TD
     end
 
     subgraph HEAD1 ["CABEZA 1: Ingestor de Ultra Bajo Consumo (C11)"]
-        C_Server["Servidor HTTP / CLI (:8080)<br/>• Non-blocking Socket I/O<br/>• Monotonic Slowloris Protection<br/>• Content-Length Overflow Guard"]
+        C_Server["Servidor HTTP / CLI (:8080)<br/>• Hilo por conexión, máx. 32 (503 si se supera)<br/>• Monotonic Slowloris Protection<br/>• Content-Length Overflow Guard<br/>• JSON RFC 8259 + UTF-8 estricto"]
         C_Validator["Validador Frontera C11<br/>• Zero-allocation bounds<br/>• Enum Level check<br/>• Anti-SSRF / CRLF URL parser"]
         C_Stmt["Prepared Statements Precompilados<br/>• sqlite3_prepare_v2<br/>• Atomic BEGIN IMMEDIATE / COMMIT"]
         C_Server --> C_Validator --> C_Stmt
@@ -46,10 +45,10 @@ flowchart TD
     end
 
     subgraph HEAD2 ["CABEZA 2: Motor de Despacho Concurrente (Go)"]
-        GO_Poller["Polling Loop No Bloqueante (:9090)<br/>• PRAGMA busy_timeout = 5000<br/>• Reclamo atómico de PENDING / FAILED"]
-        GO_Pool["Worker Pool Concurrente<br/>• Goroutines acotadas por contexto<br/>• Exponential Backoff + Full Jitter<br/>• Dead-Letter Queue (DLQ tras max_attempts)"]
+        GO_Poller["Polling Loop No Bloqueante (:9090)<br/>• PRAGMA busy_timeout = 5000<br/>• Reserva atómica con lease (UPDATE … RETURNING)"]
+        GO_Pool["Worker Pool Concurrente<br/>• Goroutines acotadas por contexto<br/>• Backoff exponencial + jitter positivo (0–20 %)<br/>• Dead-Letter Queue (DLQ tras max_attempts)"]
         GO_Net["Capa de Red Anti-SSRF<br/>• net.Dialer.Control (DNS Rebinding Guard)<br/>• Bloqueo Cloud Metadata 169.254.0.0/16<br/>• Response Body Limit (4KB) & Timeouts"]
-        GO_HMAC["Firma Criptográfica<br/>• X-Cerberus-Signature-256 (HMAC-SHA256)"]
+        GO_HMAC["Firma Criptográfica (opcional)<br/>• X-Cerberus-Signature-256 (HMAC-SHA256)<br/>• Solo si CERBERUS_WEBHOOK_SECRET está definido"]
         GO_Poller --> GO_Pool --> GO_Net --> GO_HMAC
     end
 
@@ -91,7 +90,7 @@ En el desarrollo de sistemas modernos, ningún lenguaje es el mejor en todos los
 | Componente | Lenguaje | Razón Técnica de Elección | Rol en Cerberus |
 |---|---|---|---|
 | **`ingestor-c`** | **C11** | • Huella de memoria mínima (< 2 MB de RSS).<br/>• Cero pausas de *Garbage Collector*.<br/>• Acceso directo a llamadas al sistema POSIX (`socket`, `fcntl`, `clock_gettime`).<br/>• Compilación nativa con SQLite embebido. | Agente colector que puede correr en nodos de borde, contenedores pequeños o como demonio del sistema sin consumir recursos. |
-| **`alerter-go`** | **Go 1.23** | • Modelo de concurrencia nativo con goroutines y canales.<br/>• Ecosistema de red maduro con control a nivel de socket (`net.Dialer.Control`).<br/>• Excelente manejo de cancelación distribuida con `context.Context`.<br/>• Compilación estática sin dependencias de runtime. | Despachador asíncrono y resiliente capaz de gestionar cientos de llamadas HTTP salientes en paralelo con reintentos y tolerancia a fallos. |
+| **`alerter-go`** | **Go 1.26** | • Modelo de concurrencia nativo con goroutines y canales.<br/>• Ecosistema de red maduro con control a nivel de socket (`net.Dialer.Control`).<br/>• Excelente manejo de cancelación distribuida con `context.Context`.<br/>• Compilación estática sin dependencias de runtime. | Despachador asíncrono y resiliente capaz de gestionar cientos de llamadas HTTP salientes en paralelo con reintentos y tolerancia a fallos. |
 | **`search-rust`** | **Rust 2021** | • Seguridad de memoria garantizada en tiempo de compilación sin overhead de GC.<br/>• Tipado algebraico estricto (`Result<T, SearchError>`) que erradica excepciones no controladas.<br/>• Sanitización léxica segura de consultas.<br/>• Serialización JSON ultrarrápida con `serde`. | API de consulta y motor analítico que expone búsqueda Full-Text FTS5 con ranking BM25 y sirve la interfaz web embebida. |
 | **Núcleo** | **SQLite (WAL)** | • Formato de archivo único, universal e independiente de arquitectura.<br/>• Modo WAL: 1 escritor exclusivo no bloquea a $N$ lectores concurrentes.<br/>• Extensión FTS5 nativa integrada con triggers automáticos. | Bus transaccional y almacén persistente que une los tres servicios sin requerir un cluster externo. |
 
@@ -118,7 +117,7 @@ En el modo tradicional de SQLite (*rollback journal*), cualquier operación de e
 
 ## 🛡️ Matriz de Amenazas y Seguridad Defensiva (SecOps)
 
-Cerberus fue auditado y sometido a pruebas de penetración activas durante su construcción. Cada vector de ataque cuenta con una mitigación estructural y pruebas automatizadas:
+Cada vector de ataque cuenta con una mitigación y pruebas automatizadas. Esta tabla describe lo que el código hace y lo que las pruebas comprueban; no es una certificación de ausencia de vulnerabilidades.
 
 | Vector de Ataque / Amenaza | Riesgo | Mitigación Implementada en Cerberus | Módulo / Componente |
 |---|---|---|---|
@@ -127,8 +126,11 @@ Cerberus fue auditado y sometido a pruebas de penetración activas durante su co
 | **Inyección de Sintaxis FTS5** | Un usuario ingresa caracteres como `" OR 1=1 --`, `NEAR(...)`, `NOT AND OR` para alterar la lógica de búsqueda en SQLite. | Sanitizador léxico en Rust (`sanitize_fts5_query`) que extrae tokens válidos, aplica prefijo seguro `*` y envuelve cada término entre comillas escapadas, limitando a un máximo de 16 tokens (`MAX_QUERY_TOKENS`). | `search-rust` |
 | **Denegación de Servicio por Deep-Pagination** | Peticiones con `offset = usize::MAX` o valores astronómicos causan integer overflow en la conversión a `i64` o consumo masivo de CPU. | Validación estricta con `MAX_OFFSET = 100_000` y límite `limit <= 100`. | `search-rust` |
 | **Slowloris / Conexiones Lentas** | Un cliente envía 1 byte cada varios segundos para agotar el pool de descriptores del servidor HTTP en C11. | Doble control: timeout por socket `SO_RCVTIMEO` / `SO_SNDTIMEO` sumado a un temporizador monotónico total de pared (`clock_gettime(CLOCK_MONOTONIC)`) de 2000 ms. | `ingestor-c` |
-| **Contrabando HTTP e Integer Overflow** | Cabeceras `Content-Length` malformadas, duplicadas o con valores superiores a `SIZE_MAX`. | Parser manual dígito a dígito en C11 con cota fija de 32 KB (`MAX_HTTP_REQ_SIZE`), rechazando valores negativos o duplicados con `413 Payload Too Large`. | `ingestor-c` |
-| **Falsificación de Alertas (Tampering)** | El receptor del webhook no puede verificar si la alerta realmente proviene de Cerberus. | Firma criptográfica HMAC-SHA256 incluida en la cabecera `X-Cerberus-Signature-256` calculada con clave compartida. | `alerter-go` |
+| **Contrabando HTTP e Integer Overflow** | Cabeceras `Content-Length` malformadas, duplicadas o con valores superiores a `SIZE_MAX`. | Parser manual dígito a dígito en C11 con cota fija de 32 KB (`MAX_HTTP_REQ_SIZE`), Respuestas: valor no numérico, negativo o duplicado → `400`; cuerpo > 32 KB → `413`; `POST` sin `Content-Length` → `411`; `Transfer-Encoding` → `400`. | `ingestor-c` |
+| **Falsificación de Alertas (Tampering)** | El receptor del webhook no puede verificar si la alerta realmente proviene de Cerberus. | Firma HMAC-SHA256 en `X-Cerberus-Signature-256` **solo si** se define `CERBERUS_WEBHOOK_SECRET`. Sin secreto los webhooks salen **sin firma** (el alerter lo advierte al arrancar). | `alerter-go` |
+| **JSON / Unicode malformado** | Texto con UTF-8 inválido o JSON roto se guarda y luego rompe a los lectores. | Parser JSON completo (RFC 8259) en C: valida todo el documento (también campos ignorados), UTF-8 estricto (RFC 3629) y decodifica `\uXXXX` con pares sustitutos. Rust lee filas antiguas inválidas sin fallar (U+FFFD). Reparación: `tools/repair_utf8.py`. | `ingestor-c`, `search-rust` |
+| **Escritura cross-site (CSRF)** | Una página web cualquiera hace `POST` al ingestor local desde el navegador de la víctima. | `POST /ingest` exige `Content-Type: application/json` (`415` si no) y rechaza cualquier `Origin` no configurado (`403`). CORS solo para los orígenes de `--cors-origin` (el dashboard). | `ingestor-c` |
+| **Entregas duplicadas** | Dos instancias del alerter envían la misma alerta. | Reserva atómica con vencimiento; el `UPDATE` final solo aplica si el lease sigue siendo propio. Ver *Garantías de entrega*. | `alerter-go` |
 | **Inyección de Código XSS** | Mensajes o orígenes con `<script>alert(1)</script>` almacenados en SQLite se renderizan en el navegador. | Cabeceras de seguridad estrictas (`Content-Security-Policy`, `X-Frame-Options: DENY`, `nosniff`) y renderizado DOM exclusivamente con `escapeHtml` y creación segura de nodos de texto. | `search-rust` (UI) |
 
 ---
@@ -169,7 +171,7 @@ El proyecto incluye un script orquestador integral para administrar los servicio
 ```bash
 ./cerberus.sh check
 ```
-Verifica que tu sistema cuente con `cc` (C11), `go` (>=1.23), `cargo` (>=1.80), `make` y `python3`.
+Comprueba presencia **y versión mínima**: `python3` (>=3.10), `make` (>=4.0), `go` (>=1.26, descargada automáticamente vía `GOTOOLCHAIN=auto`), `rustc`/`cargo` (>=1.89), además de `cc` (C11), `curl` y `flock` (obligatorios para `start`). Sale con error si falta algo o la versión es menor.
 
 ### 2. Iniciar el sistema completo
 ```bash
@@ -196,6 +198,15 @@ Inserta eventos de prueba a través de C11, ejecuta consultas FTS5 en Rust y mue
 ./cerberus.sh stop     # Detención limpia de todos los servicios
 ```
 
+El lanzador solo detiene procesos propios: cada archivo PID guarda `pid`, tiempo de inicio y binario, y se verifican contra `/proc` antes de enviar señales (un PID reutilizado por otro programa nunca se mata). Un lock (`flock`) impide dos `start`/`stop` simultáneos, cada servicio tiene un plazo total de arranque (`CERBERUS_HEALTH_TIMEOUT`, 10 s) y, si uno falla, se detienen solo los servicios iniciados en ese intento.
+
+### Garantías de entrega de alertas
+
+* **Al menos una vez (at-least-once).** Cada entrega se reserva de forma atómica (`UPDATE … RETURNING` que mueve `next_retry_at` al vencimiento del lease); otra instancia no puede tomarla mientras el lease esté vigente. Si el proceso muere a mitad de envío, la entrega se reintenta al vencer el lease, por lo que **el receptor puede recibir duplicados**.
+* **Idempotencia en el receptor:** todas las peticiones llevan `Idempotency-Key: cerberus-delivery-<id>` y `X-Cerberus-Delivery-ID`, estables entre reintentos. El receptor debe descartar claves ya procesadas.
+* **Backoff:** `base · 2^(intento-1)` más un jitter positivo de 0–20 %, con tope en `MaxBackoff` (no es *Full Jitter*).
+* **Firma:** HMAC-SHA256 solo con `CERBERUS_WEBHOOK_SECRET`; sin él, los mensajes van sin firma.
+
 ---
 
 ## 📡 Especificación de la API HTTP
@@ -214,9 +225,13 @@ Inserta eventos de prueba a través de C11, ejecuta consultas FTS5 en Rust y mue
     }'
   ```
   **Respuesta:** `201 Created` / `{"status":"ok","event_id":142}`
-* **`GET /health`**: `200 OK` `{"status":"ok","service":"cerberus-ingestor-c"}`
+
+  Errores: `400` JSON inválido (todo el documento se valida), UTF-8 inválido, campos faltantes/duplicados, byte NUL o `Content-Length` malformado/negativo/duplicado · `403` `Origin` no permitido · `411` sin `Content-Length` · `413` cuerpo > 32 KB · `415` `Content-Type` distinto de `application/json` · `503` más de 32 conexiones simultáneas.
+* **`OPTIONS /ingest`**: preflight CORS. `204` con `Access-Control-Allow-*` solo para orígenes dados con `--cors-origin` (el lanzador pasa el del dashboard); `403` para el resto.
+* **`GET /health`**: `200 OK` `{"status":"ok","service":"cerberus-ingestor"}`
 
 ### 2. Buscador & Analítica (`search-rust` en puerto `8081`)
+* Opción `--ingest-url http://127.0.0.1:<puerto>`: URL del ingestor que usa el simulador del dashboard (el lanzador la pasa según `CERBERUS_INGEST_PORT`). Atiende hasta 32 conexiones en paralelo.
 * **`GET /search?q=timeout*&level=CRITICAL&limit=10&offset=0`**: Búsqueda Full-Text FTS5 con ranking BM25 y snippets.
   ```json
   {
@@ -252,7 +267,7 @@ Inserta eventos de prueba a través de C11, ejecuta consultas FTS5 en Rust y mue
 
 ---
 
-## 🧪 Batería de Pruebas y Cobertura (100% Passing)
+## 🧪 Batería de Pruebas
 
 Todas las suites se ejecutan de forma orquestada con:
 ```bash
@@ -262,10 +277,12 @@ make test
 | Módulo | Pruebas Unitarias & Integración | Pruebas de Seguridad / Ataque Red Team | Resultado |
 |---|---|---|---|
 | **`schema/`** | • WAL mode & Foreign Keys activas.<br/>• CRUD y sincronización FTS5 por triggers.<br/>• Restricciones de longitud y niveles.<br/>• Borrado en cascada `ON DELETE CASCADE`. | • Payloads de inyección SQL en todos los campos.<br/>• Bombas lógicas (>16KB JSON, >8KB texto).<br/>• Rechazo de JSON escalar/arrays.<br/>• Bloqueo de SSRF y URLs malformadas.<br/>• Auditoría de permisos `0600` e higiene de secretos. | **9 / 9 PASS** |
-| **`ingestor-c/`** | • Permisos restrictivos `0600` en `.db`.<br/>• Inserción de 5 niveles de severidad.<br/>• Reglas de creación atómica en `alert_deliveries`.<br/>• Ingesta masiva por lotes (`cerberus_ingest_batch`) y *rollback* ante fallo.<br/>• Self-test integrado en el binario CLI. | • Inmunidad ante `SIGPIPE` en desconexiones abruptas.<br/>• Desbordamiento de enteros en `Content-Length`.<br/>• Bloqueo de payloads de 100 KB (`413 Payload Too Large`).<br/>• Ataques Slowloris y clientes lentos.<br/>• Evasión de SSRF con IPs decimales/hexadecimales. | **11 / 11 PASS** |
-| **`alerter-go/`** | • Entrega exitosa con verificación de firma HMAC-SHA256.<br/>• Recuperación tras fallo transitorio (`500` / timeout).<br/>• Transición automática a Dead-Letter Queue (`DEAD`).<br/>• Worker pool concurrente (26 alertas simultáneas sin `SQLITE_BUSY`). | • Bloqueo de DNS Rebinding en `net.Dialer.Control`.<br/>• Bloqueo de Open Redirect (`301`/`302`/`307`).<br/>• Bombas de respuesta HTTP de 10 MB (Tar Pit).<br/>• Truncamiento seguro de errores en límites de runes UTF-8.<br/>• Timeouts de cabecera anti-Slowloris en métricas. | **11 / 11 PASS** |
-| **`search-rust/`** | • Indexación y ordenamiento por relevancia BM25.<br/>• Búsqueda por prefijo seguro (`timeout*`).<br/>• Paginación multi-página con `total_matches`.<br/>• Validación de límites `limit` y `offset`.<br/>• Resumen analítico tipado (`get_summary`). | • Inyección de operadores FTS5 y comillas desbalanceadas.<br/>• Bloqueo de bytes nulos `%00` y caracteres de control.<br/>• DoS por bombas de tokens (`MAX_QUERY_TOKENS = 16`).<br/>• Desbordamiento de paginación (`MAX_OFFSET = 100_000`).<br/>• Enmascaramiento de errores internos en respuestas `500`. | **19 / 19 PASS** |
-| **E2E Pipeline** | • **Flujo Completo Políglota:** C11 ingesta eventos → Go despacha webhooks firmados con verificación HMAC → Rust indexa y entrega resultados FTS5 en la interfaz web. | **1 / 1 PASS** |
+| **`ingestor-c/`** | • Permisos restrictivos `0600` en `.db`.<br/>• Inserción de 5 niveles de severidad.<br/>• Reglas de creación atómica en `alert_deliveries`.<br/>• Ingesta masiva por lotes (`cerberus_ingest_batch`) y *rollback* ante fallo.<br/>• Self-test integrado en el binario CLI. | • Inmunidad ante `SIGPIPE` en desconexiones abruptas.<br/>• Desbordamiento de enteros en `Content-Length`.<br/>• Bloqueo de payloads de 100 KB (`413 Payload Too Large`).<br/>• Ataques Slowloris y clientes lentos.<br/>• Evasión de SSRF con IPs decimales/hexadecimales.<br/>• Regresiones de auditoría: UTF-8 inválido, `\uXXXX`/emoji, JSON inválido en campos ignorados, CORS, conexión ociosa, 64 ingestas en paralelo, permisos con `umask 022`. | **20 tests + autotest** |
+| **`alerter-go/`** | • Entrega exitosa con verificación de firma HMAC-SHA256.<br/>• Recuperación tras fallo transitorio (`500` / timeout).<br/>• Transición automática a Dead-Letter Queue (`DEAD`).<br/>• Worker pool concurrente (26 alertas simultáneas sin `SQLITE_BUSY`). | • Bloqueo de DNS Rebinding en `net.Dialer.Control`.<br/>• Bloqueo de Open Redirect (`301`/`302`/`303`/`307`/`308`, cada código verificado).<br/>• Bombas de respuesta HTTP de 10 MB (Tar Pit).<br/>• Truncamiento seguro de errores en límites de runes UTF-8.<br/>• Timeouts de cabecera anti-Slowloris en métricas.<br/>• Regresiones: dos instancias sin entregas duplicadas, lease perdido, base `0600`. | **14 tests** |
+| **`search-rust/`** | • Indexación y ordenamiento por relevancia BM25.<br/>• Búsqueda por prefijo seguro (`timeout*`).<br/>• Paginación multi-página con `total_matches`.<br/>• Validación de límites `limit` y `offset`.<br/>• Resumen analítico tipado (`get_summary`). | • Inyección de operadores FTS5 y comillas desbalanceadas.<br/>• Bloqueo de bytes nulos `%00` y caracteres de control.<br/>• DoS por bombas de tokens (`MAX_QUERY_TOKENS = 16`).<br/>• Desbordamiento de paginación (`MAX_OFFSET = 100_000`).<br/>• Enmascaramiento de errores internos en respuestas `500`.<br/>• Regresiones: filas con UTF-8 inválido, base `0600`, conexión ociosa, URL del ingestor configurable. | **24 tests** |
+| **E2E Pipeline** | • **Flujo Completo Políglota:** C11 ingesta eventos → Go despacha webhooks firmados con verificación HMAC → Rust indexa y entrega resultados FTS5 → flujo del dashboard (preflight CORS + POST con `Origin`). | **1 test** |
+
+Los resultados se verifican automáticamente en cada push y pull request con GitHub Actions (`.github/workflows/ci.yml`); el badge del encabezado refleja el estado real del último commit de `main`. La E2E simula las peticiones del navegador, pero no ejecuta un navegador real.
 
 ---
 
@@ -292,12 +309,15 @@ Cerberus/
 │   ├── src/                  # Motor de búsqueda, sanitizador FTS5 y servidor HTTP
 │   ├── src/static/           # Dashboard Web minimalista embebido (index.html)
 │   └── tests/                # Pruebas de integración y pruebas de ataque
-└── tests/
-    └── test_e2e_cerberus.py  # Prueba de integración end-to-end de las tres cabezas
+├── tools/
+│   └── repair_utf8.py        # Detecta/repara filas antiguas con UTF-8 inválido
+├── tests/
+│   └── test_e2e_cerberus.py  # Prueba de integración end-to-end de las tres cabezas
+└── .github/                  # CI (GitHub Actions) y Dependabot
 ```
 
 ---
 
 ## 📜 Licencia
 
-Desarrollado bajo licencia MIT. Código abierto para fines educativos, investigación y bases de proyectos de infraestructura de alto rendimiento.
+Distribuido bajo licencia MIT (ver [`LICENSE`](LICENSE)). Código abierto para fines educativos, investigación y bases de proyectos de infraestructura de alto rendimiento.

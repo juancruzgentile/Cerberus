@@ -50,6 +50,7 @@ test: $(TARGET) $(TEST_BIN)
 	@rm -f $(BUILD_DIR)/test_cerberus.db $(BUILD_DIR)/test_cerberus.db-wal $(BUILD_DIR)/test_cerberus.db-shm
 	./$(TEST_BIN)
 	python3 tests/test_security_ingestor.py
+	python3 tests/test_audit_regressions.py
 
 clean:
 	rm -rf $(BUILD_DIR)/ingestor.o $(BUILD_DIR)/main.o $(BUILD_DIR)/test_ingestor.o $(BIN_DIR)

@@ -1,0 +1,153 @@
+CERBERUS — CORRECCIONES DE LA AUDITORÍA (commit base fac6998)
+===============================================================
+Formato de cada entrada:  Problema · Solución · Dónde · Test que lo cubre
+Todos los tests nuevos fallaban con el código anterior y pasan ahora.
+Verificar todo con:  make test
+
+
+1. ALTA — UTF-8 inválido aceptado (201) y luego rompía las consultas de Rust
+   Problema : C guardaba bytes UTF-8 inválidos; Rust fallaba al leer esa fila.
+   Solución : - Validador UTF-8 estricto (RFC 3629: sin overlongs, sin
+                surrogates, <= U+10FFFF) en cerberus_validate_event(): cubre
+                HTTP y CLI (source, message, metadata, webhook).
+              - Rust lee columnas de texto con conversión tolerante
+                (byte inválido -> U+FFFD): datos viejos ya no rompen consultas.
+              - tools/repair_utf8.py: lista filas inválidas; con --fix hace
+                backup 0600 y las repara en una transacción (FTS5 se
+                resincroniza solo por trigger). Parar servicios antes de --fix.
+   Dónde    : ingestor-c/src/ingestor.c (cerberus_utf8_seq_len / _valid),
+              search-rust/src/lib.rs (text_lossy), tools/repair_utf8.py
+   Tests    : test_audit_regressions.py (test_invalid_utf8_rejected,
+              test_cli_mode_rejects_invalid_utf8),
+              audit_regression_test.rs (invalid_utf8_rows_do_not_break_...)
+
+2. ALTA — "stop" podía matar procesos ajenos (PID reutilizado)
+   Solución : El archivo PID guarda "pid starttime binario". Antes de señalar
+              se exige: PID numérico, starttime igual al de /proc/<pid>/stat y
+              /proc/<pid>/exe == binario esperado. Si no coincide, se borra el
+              archivo y NO se mata nada. Lock con flock: no hay dos start/stop
+              a la vez (los servicios no heredan el fd del lock: 9>&-).
+   Dónde    : cerberus.sh (owned_pid, stop_service, acquire_lock)
+   Verificado: PID apuntando a un "sleep" -> sigue vivo tras stop.
+
+3. ALTA — Reclamo de alertas no atómico (entregas duplicadas con 2 instancias)
+   Solución : Reserva con lease: un único UPDATE ... RETURNING mueve
+              next_retry_at a now+lease (vencimiento). Otra instancia ya no ve
+              la fila como pendiente. El UPDATE final (SENT/FAILED/DEAD) exige
+              next_retry_at == lease propio (token de propiedad); si se perdió
+              el lease no pisa el estado. Si el proceso muere, se reintenta al
+              vencer. Sin cambios de esquema.
+              Garantía real documentada: AL MENOS UNA VEZ. Cada webhook lleva
+              "Idempotency-Key: cerberus-delivery-<id>" para que el receptor
+              descarte duplicados.
+   Dónde    : alerter-go/internal/dispatcher/dispatcher.go (claimDueAlerts,
+              markSent, markFailedOrDead, checkOwned)
+   Tests    : audit_regression_test.go (TwoInstancesNeverDeliverTwice,
+              LostLeaseDoesNotOverwriteState)
+
+4. MEDIA — Dashboard no podía enviar eventos (sin CORS, puerto 8080 fijo)
+   Solución : - C responde OPTIONS /ingest y añade Access-Control-Allow-Origin
+                SOLO para orígenes dados con --cors-origin (máx. 4).
+              - Cualquier otro Origin -> 403; POST sin
+                Content-Type: application/json -> 415 (bloquea CSRF con
+                formularios text/plain); POST sin Content-Length -> 411.
+              - Rust recibe --ingest-url (solo http://127.0.0.1|localhost:<p>)
+                y lo inyecta en el HTML y en la CSP (connect-src).
+              - cerberus.sh pasa ambos flags según los puertos configurados.
+   Dónde    : ingestor-c/src/main.c, search-rust/src/main.rs,
+              search-rust/src/static/index.html, cerberus.sh
+   Tests    : test_cors_preflight_and_origin_policy (C),
+              dashboard_uses_configured_ingest_url (Rust), E2E (preflight +
+              POST con Origin, como el navegador)
+
+5. MEDIA — \uXXXX no ASCII guardado como '?' ("café" -> "caf?")
+   Solución : Decodificación a UTF-8 de \uXXXX incluidos pares sustitutos
+              (emoji). Sustitutos sueltos o invertidos -> 400.
+   Dónde    : ingestor-c/src/main.c (parse_json_string, utf8_encode)
+   Tests    : test_unicode_escapes_round_trip
+
+6. MEDIA — JSON inválido aceptado en campos ignorados ("unused":notJSON)
+   Solución : Parser JSON completo RFC 8259 (strings, números, true/false/null,
+              arrays, objetos, profundidad máx. 32). Se valida TODO el
+              documento. Además: claves duplicadas de campos conocidos -> 400,
+              byte NUL dentro del cuerpo -> 400, metadata como string debe
+              contener un objeto JSON válido.
+   Dónde    : ingestor-c/src/main.c (skip_json_value, parse_ingest_json_body)
+   Tests    : test_whole_document_is_validated, test_nul_byte_in_body_rejected
+
+7. MEDIA — Una conexión ociosa bloqueaba a las demás
+   Solución : C: un hilo por conexión, máx. 32 simultáneas (si no, 503),
+              mutex alrededor del handle SQLite (statements compartidos),
+              accept con poll() para atender SIGTERM y espera acotada (5 s) a
+              los hilos antes de cerrar la base.
+              Rust: mismo esquema (hilo por conexión, máx. 32, Mutex del
+              motor; el lock se suelta antes de escribir al socket).
+   Dónde    : ingestor-c/src/main.c (run_http_server, client_worker),
+              search-rust/src/main.rs (serve_http, ServerCtx)
+   Tests    : test_idle_connection_does_not_block,
+              test_parallel_ingest_is_consistent (64 POST en paralelo),
+              idle_connection_does_not_block_health (Rust)
+
+8. MEDIA — Permisos de la base dependían de qué cabeza la creaba (0644)
+   Solución : Política común en C, Go y Rust: crear/forzar la base con 0600
+              antes de abrir SQLite y aplicar 0600 a -wal/-shm. El lanzador
+              deja la carpeta de datos en 0700.
+   Dónde    : ingestor.c (cerberus_init), dispatcher.go (ensurePrivateDBFile),
+              lib.rs (ensure_private_db_file)
+   Tests    : los tres con umask 022 (C, Go y Rust)
+
+9. Lanzador: arranque sin plazo real y sin recuperación
+   Solución : curl con --connect-timeout 1 --max-time 2 y plazo total por
+              servicio (CERBERUS_HEALTH_TIMEOUT, 10 s); falla antes si el
+              proceso murió. Si un servicio falla, se detienen SOLO los
+              iniciados en ese intento. curl pasa a ser obligatorio.
+              "check" ahora compara versiones mínimas (sort -V).
+              Nueva variable CERBERUS_RUN_DIR (carpeta de PIDs/logs/lock).
+   Dónde    : cerberus.sh (wait_health, rollback_start, cmd_check)
+   Verificado: puerto del search ocupado -> ingestor y alerter detenidos.
+
+10. Test de redirecciones no probaba 301/303/307/308
+   Problema : Enviaba "Moved_Permanently" y comparaba con "Moved Permanently":
+              todos los casos caían en 302.
+   Solución : El código va como número (?code=308); valor desconocido -> 400;
+              el test verifica que cada código se sirvió de verdad.
+   Dónde    : alerter-go/internal/dispatcher/security_test.go
+
+11. SQLite desactualizado (C 3.46.1, Go/Rust 3.46.0) + Go con CVEs
+   Solución : Las tres cabezas en SQLite 3.54.1:
+              - C: amalgamación oficial 3.54.1 (SHA3-256 verificado).
+              - Rust: rusqlite 0.32 -> 0.41 (MSRV pasa a Rust 1.89).
+              - Go: modernc.org/sqlite 1.34.5 -> 1.61.0.
+              govulncheck encontró vulnerabilidades alcanzables en la librería
+              estándar de Go 1.23.6 (net/http, crypto/tls, net/url...):
+              go.mod pasa a Go 1.26.10 (con GOTOOLCHAIN=auto se descarga sola).
+              Resultado: govulncheck y cargo audit sin vulnerabilidades.
+              Compatibilidad FTS5: todas las suites pasan con el nuevo motor.
+
+12. README con garantías no comprobadas — corregido
+   - "Reclamo atómico"     -> reserva con lease + garantía at-least-once.
+   - "E/S no bloqueante"   -> hilos acotados (32 conexiones).
+   - "Full Jitter"         -> jitter positivo 0–20 % (lo que hace el código).
+   - HMAC                  -> opcional; sin CERBERUS_WEBHOOK_SECRET no se
+                              firma (el alerter ahora lo advierte al arrancar).
+   - "check verifica versiones" -> ahora es cierto.
+   - Content-Length        -> 400 negativo/duplicado/malformado, 413 > 32 KB,
+                              411 si falta.
+   - Licencia MIT          -> añadido archivo LICENSE.
+   - Badges estáticos de "tests/seguridad" -> badge real de CI.
+
+13. Repositorio / GitHub
+   - .github/workflows/ci.yml : make test + govulncheck + cargo audit en cada
+     push/PR a main.
+   - .github/dependabot.yml   : gomod, cargo y github-actions semanal.
+
+
+PENDIENTE (requiere al dueño del repo en GitHub, no es código)
+   - Activar reglas de protección de main (exigir CI verde).
+   - Activar "Private vulnerability reporting".
+   - Crear etiqueta/release tras validar la re-auditoría.
+
+LIMITACIONES CONOCIDAS (documentadas, no son fallos)
+   - Entrega de alertas: al menos una vez; el receptor debe deduplicar.
+   - El lanzador usa /proc y flock: requiere Linux.
+   - La E2E simula las peticiones del navegador; no ejecuta un navegador real.

@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: alerter-go/go.mod
+          cache-dependency-path: alerter-go/go.sum
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Toolchain check
+        run: ./cerberus.sh check
+      - name: Build + all suites (schema, C, Go, Rust, E2E)
+        run: make test
+
+  audit:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: alerter-go/go.mod
+          cache-dependency-path: alerter-go/go.sum
+      - uses: dtolnay/rust-toolchain@stable
+      - name: govulncheck
+        working-directory: alerter-go
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+      - name: cargo audit
+        working-directory: search-rust
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit

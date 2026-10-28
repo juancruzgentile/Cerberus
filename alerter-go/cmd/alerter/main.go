@@ -59,6 +59,10 @@ func main() {
 		Logger:        logger,
 	}
 
+	if cfg.SigningSecret == "" {
+		logger.Warn("CERBERUS_WEBHOOK_SECRET not set: webhooks will be sent WITHOUT HMAC signature")
+	}
+
 	disp, err := dispatcher.New(cfg, db)
 	if err != nil {
 		logger.Error("failed to create dispatcher", "error", err)

@@ -87,6 +87,17 @@ const char *cerberus_last_error(const cerberus_db_t *db);
 cerberus_status_t cerberus_validate_event(const cerberus_event_t *event);
 
 /**
+ * @brief Returns the length (1..4) of the well-formed UTF-8 sequence at `p`
+ *        (RFC 3629: no overlongs, no surrogates, <= U+10FFFF), or 0 if invalid.
+ */
+size_t cerberus_utf8_seq_len(const unsigned char *p, size_t avail);
+
+/**
+ * @brief Returns 1 if `s[0..len)` is entirely well-formed UTF-8, else 0.
+ */
+int cerberus_utf8_valid(const char *s, size_t len);
+
+/**
  * @brief Initializes the SQLite database connection, enforces 0600 file permissions,
  *        applies the schema/PRAGMAs, and precompiles all prepared statements.
  *
