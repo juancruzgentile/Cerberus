@@ -308,8 +308,19 @@ fn text_lossy(row: &rusqlite::Row<'_>, idx: usize) -> rusqlite::Result<String> {
 fn ensure_private_db_file(path: &Path) -> Result<(), SearchError> {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let s = path.to_string_lossy();
-    if s == ":memory:" || s.starts_with("file::memory:") {
+    // Only the exact ":memory:" name is exempt. A prefix test is not enough:
+    // SQLite reads "file::memory:disk" as the FILE ":memory:disk".
+    if s == ":memory:" {
         return Ok(());
+    }
+    // rusqlite opens with SQLITE_OPEN_URI: "file:x.db" would make SQLite use
+    // "x.db" while this function protected a file literally named "file:x.db".
+    // Every URI (file::memory: included) is refused instead of guessing its
+    // real target; use ":memory:" for an in-memory database.
+    if s.starts_with("file:") {
+        return Err(SearchError::ValidationError(format!(
+            "SQLite URIs are not supported for the database path ({s}); pass a plain filesystem path"
+        )));
     }
     let f = fs::OpenOptions::new()
         .read(true)

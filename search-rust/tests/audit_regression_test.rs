@@ -21,6 +21,18 @@ fn temp_db(tag: &str) -> PathBuf {
     p
 }
 
+/// Deletes the temporary database (and -wal/-shm) when the test ends, even if
+/// it fails. Declare it BEFORE the server so the server is dropped first.
+struct DbCleanup(PathBuf);
+
+impl Drop for DbCleanup {
+    fn drop(&mut self) {
+        for s in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", self.0.display(), s));
+        }
+    }
+}
+
 fn free_port() -> u16 {
     TcpListener::bind("127.0.0.1:0")
         .and_then(|l| l.local_addr())
@@ -115,6 +127,7 @@ fn new_database_is_private_with_permissive_umask() {
 #[test]
 fn idle_connection_does_not_block_health() {
     let db = temp_db("idle");
+    let _cleanup = DbCleanup(db.clone());
     let port = free_port();
     let _srv = start_server(&db, port, &[]);
 
@@ -135,6 +148,7 @@ fn idle_connection_does_not_block_health() {
 #[test]
 fn dashboard_uses_configured_ingest_url() {
     let db = temp_db("ui");
+    let _cleanup = DbCleanup(db.clone());
     let port = free_port();
     let _srv = start_server(&db, port, &["--ingest-url", "http://127.0.0.1:18080"]);
 
@@ -151,4 +165,61 @@ fn ingest_url_rejects_non_loopback_values() {
         .output()
         .expect("run");
     assert!(!out.status.success());
+}
+
+/// Re-audit #2 (Rust side): "file:x.db" used to protect a file literally named
+/// "file:x.db" while SQLite (opened with SQLITE_OPEN_URI) created "x.db" as 0644.
+/// SQLite URIs are now refused and nothing is created.
+#[test]
+fn sqlite_uri_paths_are_rejected_and_create_nothing() {
+    let dir = std::env::temp_dir().join(format!("cerberus_reaudit_uri_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let abs = format!("file:{}/abs.db", dir.display());
+    for dsn in [
+        "file:rel.db",
+        abs.as_str(),
+        "file:rel.db?mode=rwc",
+        // re-audit 2: a "file::memory:" PREFIX is a file for SQLite
+        "file::memory:",
+        "file::memory:disk",
+        "file::memory:disk?mode=rwc",
+    ] {
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg("umask 022; exec \"$0\" --db \"$1\" --schema \"$2\" --summary")
+            .arg(env!("CARGO_BIN_EXE_cerberus-search"))
+            .arg(dsn)
+            .arg(schema_path())
+            .current_dir(&dir)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run");
+        assert!(!status.success(), "{dsn} should be rejected");
+    }
+    let left: Vec<_> = std::fs::read_dir(&dir).expect("ls").map(|e| e.unwrap().file_name()).collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(left.is_empty(), "files created for rejected URIs: {left:?}");
+}
+
+/// ":memory:" is still accepted and leaves nothing on disk.
+#[test]
+fn plain_memory_database_creates_no_file() {
+    let dir = std::env::temp_dir().join(format!("cerberus_reaudit_mem_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("mkdir");
+    let status = Command::new(env!("CARGO_BIN_EXE_cerberus-search"))
+        .args(["--db", ":memory:", "--schema"])
+        .arg(schema_path())
+        .arg("--summary")
+        .current_dir(&dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("run");
+    let left: Vec<_> = std::fs::read_dir(&dir).expect("ls").map(|e| e.unwrap().file_name()).collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(status.success(), ":memory: must be accepted");
+    assert!(left.is_empty(), "files created for :memory:: {left:?}");
 }

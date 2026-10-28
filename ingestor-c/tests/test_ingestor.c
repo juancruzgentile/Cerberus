@@ -11,6 +11,8 @@
  *      when any event fails C validation or SQLite CHECK constraints mid-transaction.
  *   5. End-to-end HTTP server (`--serve`) integration testing (`GET /health`, `POST /ingest`)
  *      and verification of SQLite persistence + FTS5 (`events_fts`) full-text indexing.
+ *   6. cerberus_interrupt(): a call waiting on a foreign lock returns CANCELLED at once
+ *      and later calls are refused (shutdown support).
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -23,6 +25,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <netinet/in.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -534,6 +537,66 @@ static bool test_http_server_integration_and_fts5(void) {
  * Main Test Runner
  * ============================================================================ */
 
+/* ============================================================================
+ * 6. cerberus_interrupt() — cancellation used by the server shutdown
+ * ============================================================================ */
+
+typedef struct {
+    cerberus_db_t *db;
+    cerberus_status_t status;
+    double seconds;
+} interrupt_job_t;
+
+static double now_seconds(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static void *blocked_ingest(void *arg) {
+    interrupt_job_t *job = (interrupt_job_t *)arg;
+    cerberus_event_t ev = {"intr", "CRITICAL", "waits on lock", "{}", "https://127.0.0.1:9443/a"};
+    double t0 = now_seconds();
+    job->status = cerberus_ingest_event(job->db, &ev, NULL);
+    job->seconds = now_seconds() - t0;
+    return NULL;
+}
+
+static bool test_interrupt_cancels_blocked_ingest(void) {
+    remove_db_files(TEST_DB_PATH);
+    cerberus_db_t *db = NULL;
+    ASSERT_TRUE(cerberus_init(TEST_DB_PATH, TEST_SCHEMA_PATH, &db) == CERBERUS_OK, "cerberus_init failed");
+
+    sqlite3 *locker = NULL;
+    ASSERT_TRUE(sqlite3_open(TEST_DB_PATH, &locker) == SQLITE_OK, "open locker failed");
+    ASSERT_TRUE(sqlite3_exec(locker, "BEGIN IMMEDIATE;", NULL, NULL, NULL) == SQLITE_OK, "lock failed");
+
+    interrupt_job_t job = { db, CERBERUS_OK, 0.0 };
+    pthread_t tid;
+    ASSERT_TRUE(pthread_create(&tid, NULL, blocked_ingest, &job) == 0, "pthread_create failed");
+    struct timespec pause = { 0, 300000000L };
+    nanosleep(&pause, NULL);
+    cerberus_interrupt(db);
+    pthread_join(tid, NULL);
+
+    ASSERT_TRUE(job.status == CERBERUS_ERR_CANCELLED, "Blocked ingest must return CERBERUS_ERR_CANCELLED");
+    ASSERT_TRUE(job.seconds < 1.5, "Blocked ingest must stop right after cerberus_interrupt (not after busy_timeout)");
+
+    sqlite3_exec(locker, "ROLLBACK;", NULL, NULL, NULL);
+    sqlite3_close(locker);
+
+    cerberus_event_t ev = {"intr", "INFO", "after cancel", "{}", NULL};
+    ASSERT_TRUE(cerberus_ingest_event(db, &ev, NULL) == CERBERUS_ERR_CANCELLED,
+                "Ingest after cerberus_interrupt must be refused");
+    ASSERT_TRUE(cerberus_ingest_batch(db, &ev, 1, NULL) == CERBERUS_ERR_CANCELLED,
+                "Batch after cerberus_interrupt must be refused");
+    ASSERT_TRUE(query_int64(TEST_DB_PATH, "SELECT COUNT(*) FROM events;") == 0, "No event may persist");
+
+    cerberus_close(db);
+    remove_db_files(TEST_DB_PATH);
+    return true;
+}
+
 int main(void) {
     fprintf(stdout, "==============================================================================\n");
     fprintf(stdout, " Cerberus Head 1 (C11 Ingestor) — QA Unit & Integration Test Suite\n");
@@ -544,6 +607,7 @@ int main(void) {
     RUN_TEST(test_atomic_alert_deliveries_rules);
     RUN_TEST(test_batch_ingest_and_atomic_rollback);
     RUN_TEST(test_http_server_integration_and_fts5);
+    RUN_TEST(test_interrupt_cancels_blocked_ingest);
 
     fprintf(stdout, "==============================================================================\n");
     fprintf(stdout, " Results: %d/%d tests passed (%d failed)\n",

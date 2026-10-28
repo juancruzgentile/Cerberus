@@ -48,7 +48,8 @@ typedef enum {
     CERBERUS_ERR_DB_PREPARE = 10,
     CERBERUS_ERR_DB_EXEC = 11,
     CERBERUS_ERR_DB_CONSTRAINT = 12,
-    CERBERUS_ERR_NOMEM = 13
+    CERBERUS_ERR_NOMEM = 13,
+    CERBERUS_ERR_CANCELLED = 14
 } cerberus_status_t;
 
 /**
@@ -101,7 +102,8 @@ int cerberus_utf8_valid(const char *s, size_t len);
  * @brief Initializes the SQLite database connection, enforces 0600 file permissions,
  *        applies the schema/PRAGMAs, and precompiles all prepared statements.
  *
- * @param db_path     Path to the SQLite database file.
+ * @param db_path     Plain path to the SQLite database file, or ":memory:".
+ *                    SQLite URIs ("file:...") are rejected with CERBERUS_ERR_DB_OPEN.
  * @param schema_path Optional path to schema.sql (if NULL, uses embedded fallback).
  * @param out_db      Output pointer receiving the initialized cerberus_db_t handle.
  * @return CERBERUS_OK on success, or an error status code.
@@ -132,6 +134,17 @@ cerberus_status_t cerberus_ingest_event(cerberus_db_t *db, const cerberus_event_
  * @return CERBERUS_OK on success, or an error status code.
  */
 cerberus_status_t cerberus_ingest_batch(cerberus_db_t *db, const cerberus_event_t *events, size_t count, size_t *out_inserted);
+
+/**
+ * @brief Cancels pending and future work on `db` (used during shutdown).
+ *
+ * Thread-safe: may be called while another thread is inside
+ * cerberus_ingest_event()/cerberus_ingest_batch(). A running statement is
+ * interrupted, a wait on a locked database stops immediately and every later
+ * ingest returns CERBERUS_ERR_CANCELLED. It does NOT free the handle: the
+ * caller must still make sure no thread uses `db` before cerberus_close().
+ */
+void cerberus_interrupt(cerberus_db_t *db);
 
 /**
  * @brief Finalizes all prepared statements and closes the SQLite connection cleanly.

@@ -9,10 +9,14 @@ Each test reproduces one reported failure against the live HTTP server:
   - no CORS preflight for the dashboard / cross-site writes allowed
   - one idle connection blocking every other request
   - database created with 0644 under umask 022
+  - SIGTERM with workers stuck on a locked DB: slow exit (~10 s, code 1)
+    and SQLite closed while workers could still be using it
 """
 
 import json
 import os
+import signal
+import threading
 import socket
 import sqlite3
 import stat
@@ -185,6 +189,187 @@ class TestAuditRegressions(unittest.TestCase):
             p = Path(str(self.db) + suffix)
             if p.exists():
                 self.assertEqual(stat.S_IMODE(p.stat().st_mode), 0o600, p.name)
+
+
+class TestShutdownWithBusyWorkers(unittest.TestCase):
+    """Re-audit #1: SIGTERM while requests wait on a locked database."""
+
+    SHUT_PORT = 18994
+
+    def test_sigterm_cancels_workers_before_closing_db(self):
+        with tempfile.TemporaryDirectory(prefix="cerberus_shutdown_") as tmp:
+            db = Path(tmp) / "locked.db"
+            proc = subprocess.Popen(
+                [str(INGESTOR_BIN), "--db", str(db), "--schema", str(SCHEMA_PATH),
+                 "--serve", str(self.SHUT_PORT)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            )
+            try:
+                deadline = time.monotonic() + 5
+                while True:
+                    try:
+                        socket.create_connection(("127.0.0.1", self.SHUT_PORT), timeout=1).close()
+                        break
+                    except OSError:
+                        if time.monotonic() > deadline:
+                            self.fail("ingestor did not start")
+                        time.sleep(0.05)
+
+                # A foreign writer holds the lock: every insert has to wait.
+                lock = sqlite3.connect(db, isolation_level=None)
+                lock.execute("BEGIN IMMEDIATE")
+
+                results = []
+                body = b'{"source":"s","level":"ERROR","message":"m","webhook_url":"https://example.com/h"}'
+
+                def send():
+                    try:
+                        with socket.create_connection(("127.0.0.1", self.SHUT_PORT), timeout=15) as s:
+                            s.sendall(b"POST /ingest HTTP/1.1\r\nContent-Type: application/json\r\n"
+                                      b"Content-Length: %d\r\n\r\n" % len(body) + body)
+                            out = b""
+                            while True:
+                                chunk = s.recv(4096)
+                                if not chunk:
+                                    break
+                                out += chunk
+                        results.append(out)
+                    except OSError as e:
+                        results.append(repr(e).encode())
+
+                threads = [threading.Thread(target=send) for _ in range(3)]
+                for t in threads:
+                    t.start()
+                time.sleep(0.5)  # workers are now blocked on the lock / DB mutex
+
+                t0 = time.monotonic()
+                proc.send_signal(signal.SIGTERM)
+                rc = proc.wait(timeout=15)
+                elapsed = time.monotonic() - t0
+                for t in threads:
+                    t.join(timeout=5)
+                lock.execute("ROLLBACK")
+                lock.close()
+                stderr = proc.stderr.read()
+                proc.stderr.close()
+
+                self.assertEqual(rc, 0, stderr)
+                self.assertLess(elapsed, 4.5, f"shutdown took {elapsed:.2f}s")
+                self.assertEqual(len(results), 3, results)
+                for r in results:
+                    self.assertTrue(r.startswith(b"HTTP/1.1 503"), r)
+                self.assertIn(b"cancelling_workers", stderr)
+                # nothing half-written, database still healthy
+                with sqlite3.connect(db) as c:
+                    self.assertEqual(c.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+                    self.assertEqual(c.execute("SELECT COUNT(*) FROM events").fetchone()[0], 0)
+                    self.assertEqual(c.execute("SELECT COUNT(*) FROM alert_deliveries").fetchone()[0], 0)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+                if not proc.stderr.closed:
+                    proc.stderr.close()
+
+    def _start(self, db: Path):
+        proc = subprocess.Popen(
+            [str(INGESTOR_BIN), "--db", str(db), "--schema", str(SCHEMA_PATH),
+             "--serve", str(self.SHUT_PORT)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                socket.create_connection(("127.0.0.1", self.SHUT_PORT), timeout=1).close()
+                return proc
+            except OSError:
+                if time.monotonic() > deadline:
+                    proc.kill()
+                    proc.wait()
+                    self.fail("ingestor did not start")
+                time.sleep(0.05)
+
+    def test_sigterm_without_requests_exits_quickly(self):
+        with tempfile.TemporaryDirectory(prefix="cerberus_shutdown_") as tmp:
+            proc = self._start(Path(tmp) / "free.db")
+            try:
+                t0 = time.monotonic()
+                proc.send_signal(signal.SIGTERM)
+                self.assertEqual(proc.wait(timeout=10), 0)
+                self.assertLess(time.monotonic() - t0, 1.0)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+
+    def test_valid_request_in_flight_finishes_during_grace(self):
+        """A valid POST that is still running when SIGTERM arrives, and can
+        finish inside the grace period, must get 201 and be stored once."""
+        with tempfile.TemporaryDirectory(prefix="cerberus_shutdown_") as tmp:
+            db = Path(tmp) / "grace.db"
+            proc = self._start(db)
+            try:
+                lock = sqlite3.connect(db, isolation_level=None)
+                lock.execute("BEGIN IMMEDIATE")   # keeps the request waiting
+                result = []
+                body = b'{"source":"grace","level":"INFO","message":"in flight"}'
+
+                def send():
+                    with socket.create_connection(("127.0.0.1", self.SHUT_PORT), timeout=15) as s:
+                        s.sendall(b"POST /ingest HTTP/1.1\r\nContent-Type: application/json\r\n"
+                                  b"Content-Length: %d\r\n\r\n" % len(body) + body)
+                        out = b""
+                        while True:
+                            chunk = s.recv(4096)
+                            if not chunk:
+                                break
+                            out += chunk
+                    result.append(out)
+
+                t = threading.Thread(target=send)
+                t.start()
+                time.sleep(0.3)                    # request is now in flight
+                proc.send_signal(signal.SIGTERM)
+                time.sleep(0.4)                    # still inside the 1.5 s grace
+                lock.execute("ROLLBACK")           # let it finish
+                lock.close()
+                rc = proc.wait(timeout=10)
+                t.join(timeout=5)
+
+                self.assertEqual(rc, 0)
+                self.assertEqual(len(result), 1)
+                self.assertTrue(result[0].startswith(b"HTTP/1.1 201"), result[0])
+                with sqlite3.connect(db) as c:
+                    n = c.execute("SELECT COUNT(*) FROM events WHERE source='grace'").fetchone()[0]
+                self.assertEqual(n, 1)
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+
+class TestDatabasePathPolicy(unittest.TestCase):
+    """Re-audit #2 (C side): "file:..." used to be skipped by the 0600 policy
+    and SQLite then created a literal 0644 file named e.g. "file::memory:"."""
+
+    def test_sqlite_uris_are_rejected_and_create_nothing(self):
+        with tempfile.TemporaryDirectory(prefix="cerberus_uri_") as tmp:
+            for dsn in ("file::memory:", "file::memory:disk", "file::memory:disk?mode=rwc",
+                        f"file:{tmp}/uri.db", "file:rel.db"):
+                r = subprocess.run(
+                    ["sh", "-c", 'umask 022; exec "$@"', "sh", str(INGESTOR_BIN), "--db", dsn,
+                     "--ingest", "--source", "s", "--level", "INFO", "--message", "m"],
+                    cwd=tmp, capture_output=True)
+                self.assertNotEqual(r.returncode, 0, dsn)
+            self.assertEqual(os.listdir(tmp), [])
+
+    def test_memory_database_creates_no_file(self):
+        with tempfile.TemporaryDirectory(prefix="cerberus_uri_") as tmp:
+            r = subprocess.run(
+                [str(INGESTOR_BIN), "--db", ":memory:", "--ingest",
+                 "--source", "s", "--level", "INFO", "--message", "m"],
+                cwd=tmp, capture_output=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(os.listdir(tmp), [])
 
 
 if __name__ == "__main__":

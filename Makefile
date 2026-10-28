@@ -4,7 +4,7 @@
 # Targets:
 #   make build   -> compila las 3 cabezas
 #   make test    -> ejecuta TODAS las suites (schema, C, Go, Rust, E2E)
-#   make e2e     -> solo la suite de integración End-to-End políglota
+#   make e2e     -> suite End-to-End políglota + pruebas del lanzador
 #   make clean   -> limpia artefactos compilados
 # ==============================================================================
 
@@ -54,6 +54,7 @@ test-rust:
 
 e2e: build
 	$(PYTHON) tests/test_e2e_cerberus.py
+	$(PYTHON) tests/test_launcher.py
 
 clean:
 	$(MAKE) -C ingestor-c clean

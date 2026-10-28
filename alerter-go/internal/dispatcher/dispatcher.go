@@ -114,7 +114,11 @@ func OpenAndInitDB(ctx context.Context, dbPath, schemaPath string) (*sql.DB, err
 		return nil, errors.New("database path cannot be empty")
 	}
 
-	if err := ensurePrivateDBFile(dbPath); err != nil {
+	target, err := resolveDBTarget(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	if err := ensurePrivateDBFile(target); err != nil {
 		return nil, err
 	}
 
@@ -152,38 +156,131 @@ func OpenAndInitDB(ctx context.Context, dbPath, schemaPath string) (*sql.DB, err
 		}
 	}
 
-	tightenCompanionFiles(dbPath)
+	tightenCompanionFiles(target)
 	return db, nil
 }
 
-func isMemoryDB(path string) bool {
-	return path == ":memory:" || strings.HasPrefix(path, "file::memory:") || strings.Contains(path, "mode=memory")
+// dbTarget is the on-disk file a DSN really opens (empty for in-memory DBs).
+type dbTarget struct {
+	file   string // filesystem path of the main database file
+	memory bool   // nothing on disk to protect
+	create bool   // SQLite may create the file (so we pre-create it as 0600)
+}
+
+// resolveDBTarget interprets dbPath exactly like modernc.org/sqlite does, so
+// the 0600 policy is applied to the file SQLite will actually use:
+//
+//   - ":memory:" is an in-memory database.
+//   - A plain name is a filename; the driver drops anything after the first
+//     '?', so "x.db?a=b" opens "x.db". Text such as "mode=memory" inside a
+//     plain name is just part of the filename.
+//   - A "file:" name is a SQLite URI (https://www.sqlite.org/uri.html): the
+//     path is percent-decoded and mode=memory / "file::memory:" mean memory.
+//
+// Options that would let the database escape the policy are refused instead of
+// silently skipped: a URI authority other than localhost, the vfs parameter,
+// and modes other than rw/rwc/memory.
+func resolveDBTarget(dbPath string) (dbTarget, error) {
+	if dbPath == ":memory:" {
+		return dbTarget{memory: true}, nil
+	}
+
+	if !strings.HasPrefix(dbPath, "file:") {
+		file, query := dbPath, ""
+		if pos := strings.IndexByte(dbPath, '?'); pos >= 1 {
+			file, query = dbPath[:pos], dbPath[pos+1:]
+		}
+		if query != "" {
+			q, err := url.ParseQuery(query)
+			if err != nil {
+				return dbTarget{}, fmt.Errorf("database path %q: invalid query: %w", dbPath, err)
+			}
+			if q.Has("vfs") {
+				return dbTarget{}, fmt.Errorf("database path %q: the vfs parameter is not supported", dbPath)
+			}
+		}
+		return dbTarget{file: file, create: true}, nil
+	}
+
+	u, err := url.Parse(dbPath)
+	if err != nil {
+		return dbTarget{}, fmt.Errorf("database URI %q: %w", dbPath, err)
+	}
+	if u.Host != "" && u.Host != "localhost" {
+		return dbTarget{}, fmt.Errorf("database URI %q: authority %q is not supported", dbPath, u.Host)
+	}
+	if u.Fragment != "" {
+		return dbTarget{}, fmt.Errorf("database URI %q: fragments are not supported", dbPath)
+	}
+	q, err := url.ParseQuery(u.RawQuery)
+	if err != nil {
+		return dbTarget{}, fmt.Errorf("database URI %q: invalid query: %w", dbPath, err)
+	}
+	if q.Has("vfs") {
+		return dbTarget{}, fmt.Errorf("database URI %q: the vfs parameter is not supported", dbPath)
+	}
+
+	// "file:rel.db" -> Opaque, "file:/abs.db" and "file:///abs.db" -> Path.
+	file := u.Path
+	if u.Opaque != "" {
+		if file, err = url.PathUnescape(u.Opaque); err != nil {
+			return dbTarget{}, fmt.Errorf("database URI %q: %w", dbPath, err)
+		}
+	}
+
+	modes := q["mode"]
+	if len(modes) > 1 {
+		return dbTarget{}, fmt.Errorf("database URI %q: mode given more than once", dbPath)
+	}
+	mode := ""
+	if len(modes) == 1 {
+		mode = modes[0]
+	}
+	switch mode {
+	case "memory":
+		return dbTarget{memory: true}, nil
+	case "", "rwc", "rw":
+	default:
+		return dbTarget{}, fmt.Errorf("database URI %q: mode=%s is not supported (use rw or rwc)", dbPath, mode)
+	}
+	if file == ":memory:" {
+		return dbTarget{memory: true}, nil
+	}
+	if file == "" {
+		// "file:" alone is a throw-away temporary database: useless here.
+		return dbTarget{}, fmt.Errorf("database URI %q: missing file path", dbPath)
+	}
+	return dbTarget{file: file, create: mode != "rw"}, nil
 }
 
 // ensurePrivateDBFile applies the common policy of the three heads: the
 // database file is created (or fixed) with 0600 regardless of the umask.
-func ensurePrivateDBFile(path string) error {
-	if isMemoryDB(path) || strings.HasPrefix(path, "file:") {
+func ensurePrivateDBFile(t dbTarget) error {
+	if t.memory {
 		return nil
 	}
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o600)
+	flags := os.O_RDWR
+	if t.create {
+		flags |= os.O_CREATE
+	}
+	f, err := os.OpenFile(t.file, flags, 0o600)
 	if err != nil {
-		return fmt.Errorf("creating database file %q: %w", path, err)
+		return fmt.Errorf("opening database file %q: %w", t.file, err)
 	}
 	defer f.Close()
 	if err := f.Chmod(0o600); err != nil {
-		return fmt.Errorf("setting 0600 on %q: %w", path, err)
+		return fmt.Errorf("setting 0600 on %q: %w", t.file, err)
 	}
 	return nil
 }
 
-// tightenCompanionFiles sets 0600 on the WAL/SHM files if they exist.
-func tightenCompanionFiles(path string) {
-	if isMemoryDB(path) || strings.HasPrefix(path, "file:") {
+// tightenCompanionFiles sets 0600 on the WAL/SHM/journal files if they exist.
+func tightenCompanionFiles(t dbTarget) {
+	if t.memory {
 		return
 	}
-	for _, suffix := range []string{"-wal", "-shm"} {
-		_ = os.Chmod(path+suffix, 0o600)
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		_ = os.Chmod(t.file+suffix, 0o600)
 	}
 }
 
