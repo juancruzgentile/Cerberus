@@ -80,6 +80,7 @@ Verificar todo con:  make test
               mutex alrededor del handle SQLite (statements compartidos),
               accept con poll() para atender SIGTERM y espera acotada (5 s) a
               los hilos antes de cerrar la base.
+              (Apagado rehecho en la re-auditoría, ver R1.)
               Rust: mismo esquema (hilo por conexión, máx. 32, Mutex del
               motor; el lock se suelta antes de escribir al socket).
    Dónde    : ingestor-c/src/main.c (run_http_server, client_worker),
@@ -95,6 +96,7 @@ Verificar todo con:  make test
    Dónde    : ingestor.c (cerberus_init), dispatcher.go (ensurePrivateDBFile),
               lib.rs (ensure_private_db_file)
    Tests    : los tres con umask 022 (C, Go y Rust)
+   (Solo cubría rutas normales; URIs completadas en la re-auditoría, ver R2.)
 
 9. Lanzador: arranque sin plazo real y sin recuperación
    Solución : curl con --connect-timeout 1 --max-time 2 y plazo total por
@@ -105,6 +107,7 @@ Verificar todo con:  make test
               Nueva variable CERBERUS_RUN_DIR (carpeta de PIDs/logs/lock).
    Dónde    : cerberus.sh (wait_health, rollback_start, cmd_check)
    Verificado: puerto del search ocupado -> ingestor y alerter detenidos.
+   (No cubría un puerto ocupado que responde 200; ver R3.)
 
 10. Test de redirecciones no probaba 301/303/307/308
    Problema : Enviaba "Moved_Permanently" y comparaba con "Moved Permanently":
@@ -142,6 +145,254 @@ Verificar todo con:  make test
    - .github/dependabot.yml   : gomod, cargo y github-actions semanal.
 
 
+RE-AUDITORÍA (sobre el commit 865156c)
+=======================================
+Cada problema se reprodujo primero. Cada prueba nueva se ejecutó contra el
+código anterior (falla) y contra el nuevo (pasa). No basta con que pase.
+
+R1. MEDIA — Apagado de C con hilos todavía activos
+   Problema : Tras SIGTERM se esperaban 5 s y se volvía aunque quedaran hilos
+              usando SQLite; main() cerraba la base igual. Con la base
+              bloqueada por otro proceso y 3 peticiones en curso, el apagado
+              tardaba ~10 s y salía con 1. Al reproducirlo con el código
+              anterior el proceso llegó a morir con SIGSEGV (uso tras cierre).
+   Solución : Apagado en 4 pasos:
+              1. Cierra el socket: no entran peticiones nuevas.
+              2. Espera de gracia de 1,5 s para que terminen normalmente.
+              3. Si quedan hilos, cerberus_interrupt(): marca la base como
+                 cancelada (atómico) y llama a sqlite3_interrupt(). La espera
+                 por bloqueo ya no usa PRAGMA busy_timeout sino un manejador
+                 propio con el mismo presupuesto (5 s) que corta al instante
+                 si se canceló. Toda ingesta posterior devuelve
+                 CERBERUS_ERR_CANCELLED y el cliente recibe 503.
+              4. Espera 3 s más. SQLite solo se cierra si no queda ningún
+                 hilo. Salida acotada: si alguno no terminó, NO se cierra la
+                 base (evita el uso tras cierre), se avisa por stderr y el
+                 proceso sale con _exit(1). WAL mantiene la base consistente.
+              Peor caso: ~4,5 s.
+   Dónde    : ingestor-c/src/main.c (run_http_server, wait_for_workers,
+              main), ingestor-c/src/ingestor.c (cerberus_interrupt,
+              cancellable_busy_handler, cancelled_or),
+              include/cerberus_ingestor.h (CERBERUS_ERR_CANCELLED)
+   Tests    : test_audit_regressions.py
+                - test_sigterm_cancels_workers_before_closing_db: base
+                  bloqueada + 3 peticiones + SIGTERM -> sale con 0 en < 4,5 s,
+                  las 3 reciben 503, integrity_check ok, nada a medio escribir.
+                  Antes: código -11 (SIGSEGV) tras ~10 s.
+                - test_sigterm_lets_inflight_requests_finish (sin bloqueo: < 1 s)
+              test_ingestor.c: test_interrupt_cancels_blocked_ingest
+   Verificado: ThreadSanitizer (3 corridas del escenario): sin avisos.
+              Reproducción de la auditoría: 9,74 s / código 1 -> 1,52 s /
+              código 0.
+   No probado: la rama "_exit(1) sin cerrar la base" (hilo que no termina ni
+              tras cancelar) no se puede provocar con los límites actuales
+              (lectura de socket acotada a 2 s, SQLite cancelable). Es una
+              red de seguridad.
+
+R2. MEDIA — Go podía crear la base con 0644 (URIs y "mode=memory" en el nombre)
+   Problema : Cualquier ruta con "mode=memory" contaba como memoria y toda URI
+              "file:" se saltaba la política. Con umask 022:
+              file:/…/uri.db -> 0644; archivo "mode=memory.db" -> 0644.
+              Además el driver quita lo que va tras '?' en rutas normales,
+              así que "x.db?_pragma=…" protegía un archivo que no se usaba.
+   Solución : resolveDBTarget() interpreta la ruta igual que modernc/sqlite:
+              - ":memory:" -> memoria.
+              - Ruta normal: el nombre es literal (con "mode=memory" incluido);
+                se corta en el primer '?' como hace el driver.
+              - URI "file:": se parsea (url.Parse), se decodifica %XX, se
+                distingue file:rel.db / file:/abs / file:///abs /
+                file://localhost/abs. mode=memory o file::memory: -> memoria.
+              La política 0600 se aplica al archivo REAL y a -wal/-shm/-journal.
+              Se rechazan explícitamente: vfs=, mode=ro (o desconocido), mode
+              repetido, host distinto de localhost, fragmento '#', y "file:"
+              sin ruta (base temporal).
+              mode=rw no crea el archivo (como SQLite) pero sí lo deja en 0600.
+   Mismo fallo en C y Rust (encontrado al revisar, no estaba en el informe):
+              - C abre SQLite SIN soporte de URI: "file::memory:" se trataba
+                como memoria pero SQLite creaba un archivo real
+                "file::memory:" con 0644 (reproducido). Ahora C solo acepta
+                ":memory:" o rutas normales; "file:..." -> error DB_OPEN.
+              - Rust (rusqlite abre con URI): "file:x.db" protegía un archivo
+                literal "file:x.db" y SQLite creaba "x.db" con 0644. Ahora
+                rechaza URIs "file:" (salvo file::memory:).
+   Dónde    : alerter-go/internal/dispatcher/dispatcher.go (resolveDBTarget,
+              ensurePrivateDBFile, tightenCompanionFiles),
+              ingestor-c/src/ingestor.c (cerberus_init),
+              search-rust/src/lib.rs (ensure_private_db_file)
+   Tests    : reaudit_permissions_test.go (8 formas de ruta con umask 022,
+              comprobando además que el esquema quedó en ESE archivo; DSN en
+              memoria no crean archivos; DSN no soportados se rechazan sin
+              crear nada; archivo previo 0644 abierto por URI queda 0600).
+              test_audit_regressions.py (TestDatabasePathPolicy),
+              audit_regression_test.rs (sqlite_uri_paths_are_rejected_...).
+
+R3. MEDIA — El lanzador anunciaba como exitoso un arranque fallido
+   Problema : Cualquier 200 en /health terminaba wait_health(). Con el puerto
+              del search ocupado por otro servidor que respondía 200, search
+              moría (Address already in use) pero start salía con 0, anunciaba
+              el dashboard y dejaba los otros servicios en marcha.
+   Solución : - Antes de lanzar cada servicio: si su puerto ya tiene un socket
+                a la escucha que no es nuestro, falla de inmediato (mensaje
+                "el puerto N ya está ocupado") y se revierte.
+              - wait_health(url, servicio, puerto): ANTES y DESPUÉS del curl
+                se comprueba que el proceso lanzado sigue vivo (mismo PID,
+                starttime y binario). Un 200 solo cuenta si TODOS los sockets
+                LISTEN de ese puerto (/proc/net/tcp y tcp6) pertenecen a
+                nuestro PID (/proc/<pid>/fd -> socket:[inodo]). Si responde
+                otro, se sigue esperando y al vencer el plazo falla con
+                "respondió, pero el puerto N no pertenece al proceso lanzado".
+              - Ante cualquier fallo: rollback_start (detiene SOLO lo iniciado
+                en ese intento; el proceso ajeno no se toca).
+              - cerberus.sh se puede cargar con "source" (solo define
+                funciones) para probar wait_health de forma aislada.
+   Dónde    : cerberus.sh (listen_inodes, listener_owned_by,
+              ensure_port_free, wait_health, cmd_start)
+   Tests    : tests/test_launcher.py (nuevo, incluido en make test / e2e)
+                - arranque normal: código 0 y los 3 servicios vivos
+                - puerto del search ocupado respondiendo 200: código != 0, sin
+                  anuncio del dashboard, ingestor y alerter revertidos,
+                  servidor ajeno intacto. Antes: código 0.
+                - puerto del ingestor ocupado: falla sin lanzar nada
+                - proceso propio vivo que no es dueño del puerto que responde
+                  200 (la carrera que la comprobación previa no cubre):
+                  wait_health lo rechaza; con su propio puerto lo acepta.
+
+Verificación final de la re-auditoría
+   - make test completo: schema, C (6 unitarios + autotest + 6 seguridad + 13
+     regresión), Go (18), Rust (25), E2E (1) y lanzador (4): todo pasa.
+   - Cada prueba nueva falla con el código de 865156c (comprobado uno a uno).
+   - No quedan procesos de prueba en ejecución.
+
+
+SEGUNDA RE-AUDITORÍA
+====================
+Igual que antes: cada fallo se reprodujo y cada prueba nueva se ejecutó
+contra la versión anterior (falla) y la nueva (pasa).
+Seguridad de las pruebas: todo corre en carpetas temporales, con puertos
+libres al azar, sin sudo, y solo se señalan procesos lanzados por la propia
+prueba. Las pruebas del lanzador usan una COPIA del lanzador y los binarios,
+de modo que reemplazar un binario no toca los compilados del proyecto.
+
+R2b. MEDIA — Rust todavía podía crear la base con 0644 (cierra R2)
+   Problema : La excepción de memoria era starts_with("file::memory:"), pero
+              SQLite lee "file::memory:disk" como el ARCHIVO ":memory:disk":
+              se creaba con 0644 (también con ?mode=rwc).
+   Solución : Solo el nombre exacto ":memory:" está exento. Toda URI "file:"
+              se rechaza, incluida "file::memory:" (usar ":memory:").
+              C ya rechazaba toda URI. Go las interpreta: "file::memory:disk"
+              es el archivo ":memory:disk" y queda 0600 (comprobado y fijado
+              con una prueba).
+   Dónde    : search-rust/src/lib.rs (ensure_private_db_file)
+   Tests    : audit_regression_test.rs: sqlite_uri_paths_are_rejected_...
+              (ahora con file::memory:, file::memory:disk,
+              file::memory:disk?mode=rwc) y plain_memory_database_creates_no_file.
+              reaudit_permissions_test.go: TestReaudit_MemoryPrefixIsAFile.
+              test_audit_regressions.py: TestDatabasePathPolicy ampliado.
+
+R4. MEDIA — stop perdía el control de un servicio si se reemplazaba su binario
+   Problema : La propiedad dependía de que /proc/<pid>/exe coincidiera con la
+              ruta del binario. Al recompilar con el servicio en marcha, Linux
+              muestra "ruta (deleted)": stop salía con 0, borraba el .pid y
+              dejaba el servicio vivo, ya sin forma de controlarlo.
+              (El problema venía de antes de las correcciones anteriores.)
+   Solución : - El registro pasa a "pid starttime dispositivo:inodo binario".
+                El dispositivo:inodo se toma del ejecutable al lanzar y se
+                compara con stat -L /proc/<pid>/exe, que sigue apuntando al
+                mismo inodo aunque el archivo se haya reemplazado.
+              - Al lanzar se espera (máx. 2 s) a que nohup haya hecho exec del
+                binario antes de guardar el registro.
+              - Cuatro estados del registro:
+                  owned    vivo + mismo starttime + mismo inodo -> se detiene
+                  stale    proceso inexistente o starttime distinto (PID
+                           reutilizado) -> se borra el registro, no se mata nada
+                  unproven vivo con ese starttime pero otro ejecutable -> NO se
+                           mata, se CONSERVA el registro y stop sale con 1
+                  none     no hay registro
+              - stop: si tras SIGTERM y SIGKILL el proceso sigue vivo, se
+                conserva el registro y se informa un fallo. stop devuelve 1 si
+                algún servicio falló (sigue intentando con los demás); restart
+                no arranca si stop falló.
+              - start se niega a lanzar un segundo servicio si su registro está
+                en estado unproven.
+              - status muestra "sin propiedad acreditada" en ese caso.
+              - Registros del formato antiguo (pid starttime ruta) se siguen
+                aceptando, comparando por ruta.
+   Dónde    : cerberus.sh (exe_ident, pid_state, owned_pid, spawn,
+              stop_service, cmd_stop, cmd_status)
+   Tests    : tests/test_launcher.py (TestStopOwnership)
+                - binario reemplazado con el servicio en marcha: status lo ve,
+                  stop sale con 0 y el proceso muere. Antes: quedaba vivo.
+                - proceso ajeno vivo (sleep) registrado con su PID y starttime
+                  reales: stop sale con 1, no lo mata y conserva el registro;
+                  start se niega y revierte. Antes: stop salía con 0 y borraba
+                  el registro.
+                - PID reutilizado (starttime distinto): registro borrado, el
+                  proceso ajeno sigue vivo.
+
+R1 (cobertura). Petición válida en curso durante la gracia de apagado
+   Antes    : test_sigterm_lets_inflight_requests_finish solo conectaba y
+              desconectaba; no enviaba ninguna petición.
+   Ahora    : test_valid_request_in_flight_finishes_during_grace: con la base
+              bloqueada se envía un POST válido, llega SIGTERM, y el bloqueo se
+              libera dentro de la gracia -> responde 201, se guarda exactamente
+              un evento y el proceso sale con 0. 5 corridas seguidas: estable.
+              La prueba anterior queda como test_sigterm_without_requests_exits_quickly.
+   Sin cambios en el código de C en esta ronda (ThreadSanitizer no se repitió).
+
+Limpieza de pruebas (encontrado al revisar)
+   Problema : Dos tests de Rust (idle_connection_does_not_block_health y
+              dashboard_uses_configured_ingest_url) dejaban su base temporal
+              en /tmp (cerberus_audit_idle_<pid>.db / cerberus_audit_ui_...)
+              en cada ejecución. Había 99 archivos acumulados.
+   Solución : Guardia DbCleanup que borra la base y sus -wal/-shm al terminar
+              el test, aunque falle. Comprobado: una ejecución nueva ya no deja
+              archivos.
+   Pendiente: los 99 archivos viejos siguen en /tmp (no se borraron sin
+              permiso explícito). Se pueden borrar a mano con:
+                rm -f /tmp/cerberus_audit_idle_* /tmp/cerberus_audit_ui_*
+
+Verificación final (segunda re-auditoría)
+   - make test completo: schema, C (6 unitarios + autotest + 6 seguridad + 14
+     regresión), Go (19), Rust (26), E2E (1) y lanzador (7): todo pasa.
+   - Pruebas nuevas comprobadas contra la versión anterior: fallan.
+   - No quedan procesos de prueba en ejecución.
+   - Sigue sin prueba ejecutada: la salida _exit(1) del ingestor (red de
+     seguridad, no se puede provocar con los límites actuales). El detector
+     de carreras de Go (-race) no enlaza en esta máquina.
+
+
+TERCERA RE-AUDITORÍA
+====================
+R4b. MEDIA — Registros PID antiguos fallaban con espacios en la ruta
+   Problema : pid_state() leía el registro con "read -r pid start ident exe":
+              en el formato antiguo ("pid starttime ruta") una ruta con
+              espacios se partía entre ident y exe, y la condición de
+              compatibilidad exigía exe vacío. Resultado: stop salía con 1 y
+              dejaba vivo un servicio iniciado por el lanzador anterior. Afecta
+              justo a la ubicación real del proyecto
+              (".../Carpeta principal/Juan Cruz/...").
+              (No se mataba nada ajeno y el registro se conservaba.)
+   Solución : Se lee la línea completa (IFS= read -r) y se separa con
+              expresiones regulares: primero PID y starttime; el RESTO de la
+              línea se conserva entero. Si empieza por "dispositivo:inodo "
+              seguido de una ruta absoluta -> formato actual; si empieza por
+              "/" -> formato antiguo (la ruta completa, con espacios);
+              cualquier otra cosa -> registro ilegible (obsoleto, no se mata
+              nada). La ruta se guarda siempre al final del registro.
+   Dónde    : cerberus.sh (pid_state)
+   Tests    : tests/test_launcher.py
+                - TestLegacyRecordPathWithSpaces / ...WithoutSpaces:
+                  servicios reales con registro antiguo -> status los ve, stop
+                  sale con 0 y los detiene; registro antiguo de un proceso
+                  ajeno -> no se mata y se conserva.
+                - Todas las pruebas del lanzador corren ahora desde una copia
+                  en una ruta CON espacios ("copia con espacios").
+              Con la lógica anterior falla exactamente el caso "antiguo con
+              espacios"; los otros dos pasan (igual que en la auditoría).
+   Verificación: make test completo pasa (lanzador: 11 pruebas). No quedan
+              procesos de prueba en ejecución.
+
+
 PENDIENTE (requiere al dueño del repo en GitHub, no es código)
    - Activar reglas de protección de main (exigir CI verde).
    - Activar "Private vulnerability reporting".
@@ -149,5 +400,9 @@ PENDIENTE (requiere al dueño del repo en GitHub, no es código)
 
 LIMITACIONES CONOCIDAS (documentadas, no son fallos)
    - Entrega de alertas: al menos una vez; el receptor debe deduplicar.
+   - Rutas de base: C y Rust solo aceptan rutas normales o ":memory:"
+     (exacto); Go acepta además URIs "file:" (sin vfs, modo rw/rwc/memory).
+   - Un servicio en estado "sin propiedad acreditada" requiere revisión
+     manual: el lanzador no lo mata ni borra su registro.
    - El lanzador usa /proc y flock: requiere Linux.
    - La E2E simula las peticiones del navegador; no ejecuta un navegador real.
