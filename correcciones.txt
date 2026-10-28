@@ -393,10 +393,15 @@ R4b. MEDIA — Registros PID antiguos fallaban con espacios en la ruta
               procesos de prueba en ejecución.
 
 
-PENDIENTE (requiere al dueño del repo en GitHub, no es código)
-   - Activar reglas de protección de main (exigir CI verde).
-   - Activar "Private vulnerability reporting".
-   - Crear etiqueta/release tras validar la re-auditoría.
+CONFIGURACIÓN DE GITHUB (antes pendiente; hecho tras aprobar la auditoría)
+   - Protección de main: ruleset "Proteger main" (activo, sin excepciones):
+     obligatorio PR, checks "test" y "audit" en verde, sin borrar la rama
+     ni force push. 0 aprobaciones obligatorias porque hay un solo
+     mantenedor (GitHub no deja aprobar el propio PR).
+   - Reporte privado de vulnerabilidades: activado. SECURITY.md explica
+     cómo usarlo (pestaña Security -> Report a vulnerability).
+   - Release v0.1.0 (versión de Cargo.toml) sobre main tras fusionar el PR
+     de las re-auditorías.
 
 LIMITACIONES CONOCIDAS (documentadas, no son fallos)
    - Entrega de alertas: al menos una vez; el receptor debe deduplicar.
