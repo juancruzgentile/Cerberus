@@ -1,4 +1,6 @@
-# Cerberus — Polyglot Telemetry, Alerting & Search Engine
+# Cerberus
+
+Telemetría, alertas y búsqueda en tres lenguajes: C, Go y Rust, unidos por un solo archivo SQLite.
 
 <p align="center">
   <img src="https://img.shields.io/badge/C11-Ingestor-00599C?logo=c&logoColor=white" alt="C11 Ingestor">
@@ -8,13 +10,25 @@
   <a href="https://github.com/juancruzgentile/Cerberus/actions/workflows/ci.yml"><img src="https://github.com/juancruzgentile/Cerberus/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
 </p>
 
-**Cerberus** es una plataforma de observabilidad, ingesta de eventos de seguridad y despacho de alertas de alto rendimiento basada en una arquitectura políglota de tres cabezas (**C11**, **Go** y **Rust**). Cada componente fue construido en el lenguaje donde su modelo de ejecución ofrece la máxima ventaja competitiva, comunicándose de forma desacoplada y sin intermediarios pesados a través de un núcleo transaccional compartido de **SQLite en modo WAL (Write-Ahead Logging)** con búsqueda de texto completo **FTS5**.
+Cerberus recibe eventos (logs, errores, avisos de seguridad), manda alertas por webhook cuando algo es grave y te deja
+buscar en todo lo que llegó. Tiene tres "cabezas", cada una en el lenguaje que mejor le queda a su trabajo:
+
+- **El ingestor, en C11**: recibe los eventos por HTTP y los guarda.
+- **El alerter, en Go**: despacha los webhooks, con reintentos.
+- **El buscador, en Rust**: búsqueda de texto completo y un dashboard web.
+
+No hablan entre ellas por red ni por una cola: comparten una base **SQLite en modo WAL** con búsqueda **FTS5**.
+
+Lo hice para aprender cómo se comportan tres lenguajes muy distintos trabajando sobre los mismos datos, y para
+practicar seguridad en serio: cada ataque que se me ocurrió (o que apareció en las auditorías) tiene su prueba.
 
 ---
 
-## 🏛️ Arquitectura del Sistema (Las 3 Cabezas)
+## Arquitectura
 
-El sistema resuelve el problema clásico de la telemetría en nodos *edge*, entornos embebidos o servidores de bajo recurso: ¿cómo ingerir miles de eventos por segundo, despachar alertas concurrentes con reintentos y ofrecer búsqueda instantánea sobre texto libre sin levantar un cluster pesado de Kafka, Redis o Elasticsearch que consuma gigabytes de memoria?
+La pregunta de la que salió: ¿se puede recibir muchos eventos, mandar alertas con reintentos y buscar en texto libre
+en una máquina chica, sin levantar Kafka, Redis o Elasticsearch? Mi respuesta fue un archivo SQLite y tres programas
+chicos alrededor.
 
 ```mermaid
 flowchart TD
@@ -83,22 +97,22 @@ flowchart TD
 
 ---
 
-## 🎯 Filosofía Políglota: ¿Por qué cada lenguaje para su tarea?
+## Por qué un lenguaje distinto para cada parte
 
-En el desarrollo de sistemas modernos, ningún lenguaje es el mejor en todos los frentes. Cerberus aprovecha las fortalezas absolutas de cada uno:
+Ningún lenguaje es el mejor para todo, y quería ver eso en la práctica:
 
-| Componente | Lenguaje | Razón Técnica de Elección | Rol en Cerberus |
+| Componente | Lenguaje | Por qué lo elegí | Qué hace |
 |---|---|---|---|
-| **`ingestor-c`** | **C11** | • Huella de memoria mínima (< 2 MB de RSS).<br/>• Cero pausas de *Garbage Collector*.<br/>• Acceso directo a llamadas al sistema POSIX (`socket`, `fcntl`, `clock_gettime`).<br/>• Compilación nativa con SQLite embebido. | Agente colector que puede correr en nodos de borde, contenedores pequeños o como demonio del sistema sin consumir recursos. |
-| **`alerter-go`** | **Go 1.26** | • Modelo de concurrencia nativo con goroutines y canales.<br/>• Ecosistema de red maduro con control a nivel de socket (`net.Dialer.Control`).<br/>• Excelente manejo de cancelación distribuida con `context.Context`.<br/>• Compilación estática sin dependencias de runtime. | Despachador asíncrono y resiliente capaz de gestionar cientos de llamadas HTTP salientes en paralelo con reintentos y tolerancia a fallos. |
-| **`search-rust`** | **Rust 2021** | • Seguridad de memoria garantizada en tiempo de compilación sin overhead de GC.<br/>• Tipado algebraico estricto (`Result<T, SearchError>`) que erradica excepciones no controladas.<br/>• Sanitización léxica segura de consultas.<br/>• Serialización JSON ultrarrápida con `serde`. | API de consulta y motor analítico que expone búsqueda Full-Text FTS5 con ranking BM25 y sirve la interfaz web embebida. |
-| **Núcleo** | **SQLite (WAL)** | • Formato de archivo único, universal e independiente de arquitectura.<br/>• Modo WAL: 1 escritor exclusivo no bloquea a $N$ lectores concurrentes.<br/>• Extensión FTS5 nativa integrada con triggers automáticos. | Bus transaccional y almacén persistente que une los tres servicios sin requerir un cluster externo. |
+| **`ingestor-c`** | **C11** | • Huella de memoria mínima (< 2 MB de RSS).<br/>• Cero pausas de *Garbage Collector*.<br/>• Acceso directo a llamadas al sistema POSIX (`socket`, `fcntl`, `clock_gettime`).<br/>• Compilación nativa con SQLite embebido. | Recibe y guarda los eventos. Es lo bastante liviano para correr en un contenedor chico o como demonio. |
+| **`alerter-go`** | **Go 1.26** | • Modelo de concurrencia nativo con goroutines y canales.<br/>• Ecosistema de red maduro con control a nivel de socket (`net.Dialer.Control`).<br/>• Excelente manejo de cancelación distribuida con `context.Context`.<br/>• Compilación estática sin dependencias de runtime. | Manda los webhooks en paralelo, reintenta los que fallan y aparta los que no hay forma de entregar. |
+| **`search-rust`** | **Rust 2021** | • Seguridad de memoria comprobada al compilar, sin GC.<br/>• Los errores van en el tipo (`Result<T, SearchError>`), así que no hay excepciones sueltas.<br/>• Sanitización léxica segura de consultas.<br/>• JSON con `serde`. | Expone la búsqueda de texto completo (FTS5, ordenada por BM25) y sirve el dashboard. |
+| **Núcleo** | **SQLite (WAL)** | • Formato de archivo único, universal e independiente de arquitectura.<br/>• Modo WAL: 1 escritor exclusivo no bloquea a $N$ lectores concurrentes.<br/>• Extensión FTS5 nativa integrada con triggers automáticos. | Es donde se encuentran los tres: guarda todo y hace de cola, sin ningún servicio aparte. |
 
 ---
 
-## ⚡ Concurrencia en SQLite: Mecánica del Modo WAL
+## Cómo conviven los tres con SQLite (modo WAL)
 
-Cerberus configura explícitamente:
+Todas las conexiones arrancan con:
 ```sql
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
@@ -106,8 +120,7 @@ PRAGMA foreign_keys = ON;
 PRAGMA busy_timeout = 5000;
 ```
 
-### ¿Por qué WAL (Write-Ahead Logging)?
-En el modo tradicional de SQLite (*rollback journal*), cualquier operación de escritura bloquea la base de datos por completo para los lectores. En modo **WAL**:
+En el modo clásico de SQLite (*rollback journal*), mientras alguien escribe nadie puede leer. Con **WAL** (Write-Ahead Logging) eso cambia:
 
 1. **Lectores no bloquean a escritores:** `search-rust` puede estar ejecutando una consulta analítica pesada o un escaneo FTS5 mientras `ingestor-c` inserta nuevos eventos simultáneamente.
 2. **Escritores no bloquean a lectores:** Cuando `ingestor-c` escribe, los cambios se anexan secuencialmente al archivo `cerberus.db-wal`. Los lectores (`alerter-go` y `search-rust`) continúan leyendo la última instantánea (*snapshot*) consistente desde `cerberus.db` y `cerberus.db-shm` (memoria compartida).
@@ -115,11 +128,11 @@ En el modo tradicional de SQLite (*rollback journal*), cualquier operación de e
 
 ---
 
-## 🛡️ Matriz de Amenazas y Seguridad Defensiva (SecOps)
+## Seguridad: qué ataques tuve en cuenta
 
-Cada vector de ataque cuenta con una mitigación y pruebas automatizadas. Esta tabla describe lo que el código hace y lo que las pruebas comprueban; no es una certificación de ausencia de vulnerabilidades.
+Para cada ataque de esta tabla hay una defensa en el código y pruebas que la verifican. Eso no quiere decir que Cerberus no tenga vulnerabilidades: quiere decir que estas las cubrí.
 
-| Vector de Ataque / Amenaza | Riesgo | Mitigación Implementada en Cerberus | Módulo / Componente |
+| Ataque | Riesgo | Qué hace Cerberus | Dónde |
 |---|---|---|---|
 | **SSRF y DNS Rebinding** | Un atacante configura una URL de webhook apuntando a `169.254.169.254` (AWS/GCP metadata) o cambia dinámicamente el registro DNS a `127.0.0.1` tras la validación. | `net.Dialer.Control` intercepta y valida la IP física resuelta **antes** del handshake TCP. Bloqueo estricto de `169.254.0.0/16`, `100.100.100.200/32`, `fd00:ec2::254`, NAT64 `64:ff9b::/96`, `0.0.0.0/8`, y RFC1918. | `alerter-go` |
 | **Open Redirect SSRF** | Un endpoint externo responde con `302 Found` redirigiendo al cliente hacia un servicio interno privado. | `http.Client.CheckRedirect` aborta inmediatamente cualquier intento de redirección HTTP. | `alerter-go` |
@@ -135,9 +148,9 @@ Cada vector de ataque cuenta con una mitigación y pruebas automatizadas. Esta t
 
 ---
 
-## 💻 Interfaz de Usuario Minimalista (Dashboard Embebido)
+## Dashboard
 
-Cerberus incluye una consola web operativa de **un único archivo HTML/CSS/JS (16 KB)** embebida directamente dentro del binario compilado de Rust (`include_str!`).
+El buscador trae un dashboard web: un solo archivo HTML con CSS y JS a mano (16 KB, sin dependencias) metido dentro del binario de Rust con `include_str!`.
 
 ```text
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
@@ -157,15 +170,15 @@ Cerberus incluye una consola web operativa de **un único archivo HTML/CSS/JS (1
 └─────────────────────────────────────┴──────────────────────────────────────────────────┘
 ```
 
-* **Acceso inmediato:** Disponible en `http://127.0.0.1:8081` en cuanto se inicia el sistema.
-* **Auto-refresco:** Sincronización automática de métricas cada 3 segundos.
-* **Búsqueda con Debounce:** Filtrado reactivo (250 ms) con resaltado visual (`<mark class="hl">`) de los términos coincidentes devueltos por SQLite FTS5.
+* Está en `http://127.0.0.1:8081` apenas arranca todo.
+* Las métricas se actualizan solas cada 3 segundos.
+* La búsqueda espera 250 ms a que dejes de escribir y resalta los términos que encontró FTS5.
 
 ---
 
-## 🚀 Inicio Rápido con el Lanzador (`cerberus.sh`)
+## Cómo probarlo (`cerberus.sh`)
 
-El proyecto incluye un script orquestador integral para administrar los servicios sin tener que abrir múltiples terminales:
+Para no tener que abrir tres terminales, hice un lanzador que se encarga de todo:
 
 ### 1. Verificar herramientas instaladas
 ```bash
@@ -177,30 +190,31 @@ Comprueba presencia **y versión mínima**: `python3` (>=3.10), `make` (>=4.0), 
 ```bash
 ./cerberus.sh start
 ```
-Compila los binarios si no existen y levanta las 3 cabezas en segundo plano:
+Compila lo que falte y levanta las tres cabezas en segundo plano:
 * **Ingestor C11:** `http://127.0.0.1:8080` (endpoints `POST /ingest`, `GET /health`)
 * **Alerter Go:** `http://127.0.0.1:9090` (endpoints `GET /health`, `GET /stats`)
 * **Search Rust & Web UI:** `http://127.0.0.1:8081` (interfaz visual en `/`, `GET /search`, `GET /summary`)
 
-### 3. Abrir la consola en el navegador
-Abre **[http://127.0.0.1:8081](http://127.0.0.1:8081)** para interactuar con la plataforma.
+### 3. Abrir el dashboard
+Entrá a **[http://127.0.0.1:8081](http://127.0.0.1:8081)**.
 
-### 4. Ejecutar una demostración automática
+### 4. Ver una demo
 ```bash
 ./cerberus.sh demo
 ```
-Inserta eventos de prueba a través de C11, ejecuta consultas FTS5 en Rust y muestra el estado de las alertas en Go.
+Mete eventos de prueba por el ingestor, hace búsquedas en el buscador y muestra cómo quedaron las alertas.
 
-### 5. Ver estado y detener
+### 5. Estado, logs y apagado
 ```bash
-./cerberus.sh status   # Ver PIDs y estado de ejecución
-./cerberus.sh logs     # Inspeccionar los últimos logs de los 3 procesos
-./cerberus.sh stop     # Detención limpia de todos los servicios
+./cerberus.sh status   # qué está corriendo y con qué PID
+./cerberus.sh logs     # las últimas líneas de log de los tres
+./cerberus.sh stop     # apaga todo de forma ordenada
+./cerberus.sh restart  # stop + start
 ```
 
-El lanzador solo detiene procesos propios: cada archivo PID guarda `pid`, tiempo de inicio y binario, y se verifican contra `/proc` antes de enviar señales (un PID reutilizado por otro programa nunca se mata). Un lock (`flock`) impide dos `start`/`stop` simultáneos, cada servicio tiene un plazo total de arranque (`CERBERUS_HEALTH_TIMEOUT`, 10 s) y, si uno falla, se detienen solo los servicios iniciados en ese intento.
+El lanzador solo detiene procesos suyos: cada archivo PID guarda `pid`, tiempo de inicio y binario, y se verifican contra `/proc` antes de enviar señales (un PID reutilizado por otro programa nunca se mata). Un lock (`flock`) impide dos `start`/`stop` simultáneos, cada servicio tiene un plazo total de arranque (`CERBERUS_HEALTH_TIMEOUT`, 10 s) y, si uno falla, se detienen solo los servicios iniciados en ese intento.
 
-### Garantías de entrega de alertas
+### Qué garantiza la entrega de alertas
 
 * **Al menos una vez (at-least-once).** Cada entrega se reserva de forma atómica (`UPDATE … RETURNING` que mueve `next_retry_at` al vencimiento del lease); otra instancia no puede tomarla mientras el lease esté vigente. Si el proceso muere a mitad de envío, la entrega se reintenta al vencer el lease, por lo que **el receptor puede recibir duplicados**.
 * **Idempotencia en el receptor:** todas las peticiones llevan `Idempotency-Key: cerberus-delivery-<id>` y `X-Cerberus-Delivery-ID`, estables entre reintentos. El receptor debe descartar claves ya procesadas.
@@ -209,10 +223,10 @@ El lanzador solo detiene procesos propios: cada archivo PID guarda `pid`, tiempo
 
 ---
 
-## 📡 Especificación de la API HTTP
+## API HTTP
 
 ### 1. Ingestor (`ingestor-c` en puerto `8080`)
-* **`POST /ingest`**: Ingesta un nuevo evento en SQLite.
+* **`POST /ingest`**: guarda un evento nuevo.
   ```bash
   curl -X POST http://127.0.0.1:8080/ingest \
     -H 'Content-Type: application/json' \
@@ -232,7 +246,7 @@ El lanzador solo detiene procesos propios: cada archivo PID guarda `pid`, tiempo
 
 ### 2. Buscador & Analítica (`search-rust` en puerto `8081`)
 * Opción `--ingest-url http://127.0.0.1:<puerto>`: URL del ingestor que usa el simulador del dashboard (el lanzador la pasa según `CERBERUS_INGEST_PORT`). Atiende hasta 32 conexiones en paralelo.
-* **`GET /search?q=timeout*&level=CRITICAL&limit=10&offset=0`**: Búsqueda Full-Text FTS5 con ranking BM25 y snippets.
+* **`GET /search?q=timeout*&level=CRITICAL&limit=10&offset=0`**: búsqueda de texto completo, ordenada por BM25 y con fragmentos resaltados.
   ```json
   {
     "sanitized_query": "\"timeout\"*",
@@ -256,25 +270,25 @@ El lanzador solo detiene procesos propios: cada archivo PID guarda `pid`, tiempo
     ]
   }
   ```
-* **`GET /summary`**: Métricas agregadas por severidad, orígenes top y estado de la cola de webhooks.
-* **`GET /`**: Retorna el dashboard interactivo en HTML5/JS vanilla.
+* **`GET /summary`**: totales por severidad, los orígenes con más eventos y el estado de la cola de webhooks.
+* **`GET /`**: el dashboard.
 
 ### 3. Observabilidad de Alertas (`alerter-go` en puerto `9090`)
-* **`GET /stats`**: Métricas de entrega de webhooks:
+* **`GET /stats`**: cómo van las entregas de webhooks:
   ```json
   {"pending": 0, "sent": 14, "failed": 1, "dead": 0, "total": 15}
   ```
 
 ---
 
-## 🧪 Batería de Pruebas
+## Pruebas
 
-Todas las suites se ejecutan de forma orquestada con:
+Todas se corren con:
 ```bash
 make test
 ```
 
-| Módulo | Pruebas Unitarias & Integración | Pruebas de Seguridad / Ataque Red Team | Resultado |
+| Módulo | Funcionamiento | Ataques | Cantidad |
 |---|---|---|---|
 | **`schema/`** | • WAL mode & Foreign Keys activas.<br/>• CRUD y sincronización FTS5 por triggers.<br/>• Restricciones de longitud y niveles.<br/>• Borrado en cascada `ON DELETE CASCADE`. | • Payloads de inyección SQL en todos los campos.<br/>• Bombas lógicas (>16KB JSON, >8KB texto).<br/>• Rechazo de JSON escalar/arrays.<br/>• Bloqueo de SSRF y URLs malformadas.<br/>• Auditoría de permisos `0600` e higiene de secretos. | **9 / 9 PASS** |
 | **`ingestor-c/`** | • Permisos restrictivos `0600` en `.db`.<br/>• Inserción de 5 niveles de severidad.<br/>• Reglas de creación atómica en `alert_deliveries`.<br/>• Ingesta masiva por lotes (`cerberus_ingest_batch`) y *rollback* ante fallo.<br/>• Self-test integrado en el binario CLI. | • Inmunidad ante `SIGPIPE` en desconexiones abruptas.<br/>• Desbordamiento de enteros en `Content-Length`.<br/>• Bloqueo de payloads de 100 KB (`413 Payload Too Large`).<br/>• Ataques Slowloris y clientes lentos.<br/>• Evasión de SSRF con IPs decimales/hexadecimales.<br/>• Regresiones de auditoría: UTF-8 inválido, `\uXXXX`/emoji, JSON inválido en campos ignorados, CORS, conexión ociosa, 64 ingestas en paralelo, permisos con `umask 022`, URIs `file:` rechazadas, apagado con base bloqueada (SIGTERM cancela, responde `503` y cierra SQLite solo sin hilos activos), petición válida que termina durante la gracia (`201`, un único evento). | **26 tests + autotest** |
@@ -283,15 +297,15 @@ make test
 | **E2E Pipeline** | • **Flujo Completo Políglota:** C11 ingesta eventos → Go despacha webhooks firmados con verificación HMAC → Rust indexa y entrega resultados FTS5 → flujo del dashboard (preflight CORS + POST con `Origin`). | — | **1 test** |
 | **`cerberus.sh`** | • `start` completo con los 3 servicios y `status`. | • Puerto ocupado por un servidor ajeno que responde `200` en `/health`: el arranque falla, se revierte y el proceso ajeno no se toca.<br/>• Proceso propio vivo pero sin el socket del puerto: `wait_health` lo rechaza.<br/>• Binario reemplazado mientras corre: `stop` lo sigue deteniendo (identidad por dispositivo:inodo).<br/>• Registro de un proceso vivo sin propiedad acreditada: no se mata, se conserva y `stop`/`start` fallan.<br/>• PID reutilizado: registro obsoleto eliminado sin matar nada.<br/>• Registros PID del formato anterior, con y sin espacios en la ruta: se siguen deteniendo; si apuntan a un proceso ajeno, se conservan.<br/>• Se ejecutan sobre una copia temporal del lanzador y los binarios, en una ruta con espacios. | **11 tests** |
 
-Los resultados se verifican automáticamente en cada push y pull request con GitHub Actions (`.github/workflows/ci.yml`); el badge del encabezado refleja el estado real del último commit de `main`. La E2E simula las peticiones del navegador, pero no ejecuta un navegador real.
+GitHub Actions las corre en cada push y pull request (`.github/workflows/ci.yml`), y el badge de arriba muestra cómo quedó el último commit de `main`. La E2E imita las peticiones del navegador, pero no abre un navegador de verdad.
 
 ---
 
-## 📦 Estructura del Repositorio
+## Estructura
 
 ```text
 Cerberus/
-├── cerberus.sh               # Script orquestador (check, build, start, status, demo, stop)
+├── cerberus.sh               # Lanzador (check, build, start, stop, restart, status, logs, demo)
 ├── Makefile                  # Orquestador Make para compilación y pruebas globales
 ├── requirements.txt          # Requisitos de toolchain del sistema (0 dependencias PyPI)
 ├── schema/
@@ -313,12 +327,20 @@ Cerberus/
 ├── tools/
 │   └── repair_utf8.py        # Detecta/repara filas antiguas con UTF-8 inválido
 ├── tests/
-│   └── test_e2e_cerberus.py  # Prueba de integración end-to-end de las tres cabezas
+│   ├── test_e2e_cerberus.py  # Prueba end-to-end de las tres cabezas
+│   └── test_launcher.py      # Pruebas del lanzador
 └── .github/                  # CI (GitHub Actions) y Dependabot
 ```
 
 ---
 
-## 📜 Licencia
+## Cómo lo hice
 
-Distribuido bajo licencia MIT (ver [`LICENSE`](LICENSE)). Código abierto para fines educativos, investigación y bases de proyectos de infraestructura de alto rendimiento.
+Cerberus lo armé con [Claude Code](https://claude.com/claude-code), el asistente de programación de Anthropic. La idea,
+el diseño de las tres cabezas y qué tenía que resistir los decidí yo; gran parte del código, las pruebas y esta
+documentación los fue escribiendo Claude Code con lo que yo le pedía y le corregía. Después le hice auditar el
+proyecto varias veces: lo que encontró y cómo se arregló está en [`correcciones.txt`](correcciones.txt).
+
+## Licencia
+
+MIT (ver [`LICENSE`](LICENSE)). Usalo para aprender, investigar o como base de lo que quieras.
